@@ -2377,6 +2377,17 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
         }
         let hover = hover_of(ui, response);
         let (below, width) = queue_row(ui, app, item, slot, hover);
+        let mut cx = Cx {
+            art: &app.art,
+            covers: &app.saved.covers,
+            playing: app.now_playing().map_or("", |playing| playing.video_id.as_str()),
+            paused: app.player.paused(),
+            liked: &app.saved.liked,
+            playlists: &app.library,
+            single: true,
+            out: &mut *out,
+        };
+        song_menu(response, &mut cx, item);
         byline(ui, out, item, response.id.with("artist"), below, sans(12.5), width);
         describe(response, &item.title);
         if hover > 0.0 {
@@ -2589,6 +2600,17 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
             let reach = left + fit(ui, &item.subtitle, sans(12.5), MUTED, width, 1).size().x;
             let zone = Rect::from_min_max(art.min, pos2(title.right().max(reach), art.bottom()));
             let open = ui.interact(zone, Id::new("bar-now-playing"), Sense::click());
+            let mut cx = Cx {
+                art: &app.art,
+                covers: &app.saved.covers,
+                playing: &item.video_id,
+                paused: app.player.paused(),
+                liked: &app.saved.liked,
+                playlists: &app.library,
+                single: true,
+                out: &mut *out,
+            };
+            song_menu(&open, &mut cx, item);
             let lift = hover_of(ui, &open);
             let symbol = if app.expanded { icon::CARET_DOWN } else { icon::CARET_UP };
             ui.painter().rect_filled(art, 6.0, shade(0.55 * lift));
