@@ -451,6 +451,15 @@ impl Client {
         Ok(parse_page(&self.music("next", body, &[])?).songs())
     }
 
+    pub fn add_to_playlist(&self, playlist_id: &str, video_id: &str) -> Result<(), String> {
+        let playlist_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+        let body = json!({
+            "playlistId": playlist_id,
+            "actions": [{ "addedVideoId": video_id }],
+        });
+        self.music("playlist/edit", body, &[]).map(drop)
+    }
+
     pub fn lyrics(&self, song: &Item, seconds: u64) -> Result<Option<Lyrics>, String> {
         let known = self.youtube_lyrics(&song.video_id);
         if matches!(&known, Ok(Some(lyrics)) if lyrics.synced) {

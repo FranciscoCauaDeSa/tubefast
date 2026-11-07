@@ -396,6 +396,7 @@ struct Cx<'a> {
     playing: &'a str,
     paused: bool,
     liked: &'a [Item],
+    playlists: &'a [Item],
     single: bool,
     out: &'a mut Vec<Action>,
 }
@@ -801,6 +802,18 @@ fn song_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
     }
     if menu_row(ui, icon::RADIO, glyph(17.0), MUTED, "Start radio").clicked() {
         choice = Some(Action::StartRadio(item.clone()));
+    }
+    if !cx.playlists.is_empty() {
+        menu_divider(ui);
+        ui.menu_button("Add to playlist", |ui| {
+            ui.set_width(MENU_WIDTH);
+            for playlist in cx.playlists.iter().filter(|playlist| !playlist.browse_id.is_empty()) {
+                if menu_row(ui, icon::LIST_PLUS, glyph(17.0), MUTED, &playlist.title).clicked() {
+                    choice = Some(Action::AddToPlaylist(item.clone(), playlist.clone()));
+                    ui.close();
+                }
+            }
+        });
     }
     let (font, tint, text) = if cx.is_liked(item) {
         (solid(17.0), ACCENT, "Remove from Liked songs")
@@ -1554,6 +1567,7 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
         playing: app.now_playing().map_or("", |item| item.video_id.as_str()),
         paused: app.player.paused(),
         liked: &app.saved.liked,
+        playlists: &app.library,
         single: matches!(route, Route::Search(_) | Route::Home),
         out: &mut *out,
     };

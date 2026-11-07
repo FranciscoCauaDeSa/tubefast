@@ -192,6 +192,7 @@ pub enum Action {
     Play(Vec<Item>, usize),
     StartRadio(Item),
     StartMix(Item),
+    AddToPlaylist(Item, Item),
     Jump(usize),
     PlayNext(Item),
     Enqueue(Item),
@@ -248,6 +249,7 @@ enum Event {
     Discord(bool),
     Pressed(Action),
     StartedRadio(Item, Result<Vec<Item>, String>, bool),
+    PlaylistAdded(String, Result<(), String>),
 }
 
 pub struct App {
@@ -710,6 +712,10 @@ impl App {
                     }
                     Err(message) => self.notify(message),
                 },
+                Event::PlaylistAdded(name, result) => match result {
+                    Ok(()) => self.notify(format!("Added to {name}")),
+                    Err(message) => self.notify(message),
+                },
                 Event::Lyrics(video_id, found) => {
                     if let Some((_, words)) = self.lyrics.as_mut().filter(|(wanted, _)| *wanted == video_id) {
                         *words = match found {
@@ -912,6 +918,14 @@ impl App {
                 std::thread::spawn(move || {
                     let result = yt.radio(&item.video_id);
                     let _ = sender.send(Event::StartedRadio(item, result, mix));
+                });
+            }
+            Action::AddToPlaylist(song, playlist) => {
+                let yt = self.yt.clone();
+                let sender = self.sender.clone();
+                std::thread::spawn(move || {
+                    let result = yt.add_to_playlist(&playlist.browse_id, &song.video_id);
+                    let _ = sender.send(Event::PlaylistAdded(playlist.title, result));
                 });
             }
             Action::Jump(index) => playback.play_index(index),
