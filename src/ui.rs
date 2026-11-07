@@ -796,6 +796,12 @@ fn song_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
     if menu_row(ui, icon::LIST_PLUS, glyph(17.0), MUTED, "Add to queue").clicked() {
         choice = Some(Action::Enqueue(item.clone()));
     }
+    if menu_row(ui, icon::PLAYLIST, glyph(17.0), MUTED, "Start mix").clicked() {
+        choice = Some(Action::StartMix(item.clone()));
+    }
+    if menu_row(ui, icon::RADIO, glyph(17.0), MUTED, "Start radio").clicked() {
+        choice = Some(Action::StartRadio(item.clone()));
+    }
     let (font, tint, text) = if cx.is_liked(item) {
         (solid(17.0), ACCENT, "Remove from Liked songs")
     } else {

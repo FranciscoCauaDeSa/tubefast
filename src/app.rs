@@ -190,6 +190,8 @@ pub enum Action {
     Forward,
     Reload,
     Play(Vec<Item>, usize),
+    StartRadio(Item),
+    StartMix(Item),
     Jump(usize),
     PlayNext(Item),
     Enqueue(Item),
@@ -245,6 +247,7 @@ enum Event {
     Lyrics(String, Result<Option<Lyrics>, String>),
     Discord(bool),
     Pressed(Action),
+    StartedRadio(Item, Result<Vec<Item>, String>, bool),
 }
 
 pub struct App {
@@ -697,6 +700,16 @@ impl App {
                 }
                 Event::Discord(linked) => self.discord_linked = Some(linked),
                 Event::Pressed(action) => self.apply(action, playback),
+                Event::StartedRadio(seed, result, mix) => match result {
+                    Ok(items) => {
+                        let mut songs = Vec::with_capacity(items.len() + 1);
+                        if mix { songs.push(seed.clone()); }
+                        songs.extend(items);
+                        if songs.is_empty() { songs.push(seed); }
+                        self.play(playback, songs, 0);
+                    }
+                    Err(message) => self.notify(message),
+                },
                 Event::Lyrics(video_id, found) => {
                     if let Some((_, words)) = self.lyrics.as_mut().filter(|(wanted, _)| *wanted == video_id) {
                         *words = match found {
@@ -882,6 +895,24 @@ impl App {
                 let growing = self.growing_list(&items);
                 self.play(playback, items, index);
                 self.growing = growing;
+            }
+            Action::StartRadio(item) => {
+                let mix = false;
+                let yt = self.yt.clone();
+                let sender = self.sender.clone();
+                std::thread::spawn(move || {
+                    let result = yt.radio(&item.video_id);
+                    let _ = sender.send(Event::StartedRadio(item, result, mix));
+                });
+            }
+            Action::StartMix(item) => {
+                let mix = true;
+                let yt = self.yt.clone();
+                let sender = self.sender.clone();
+                std::thread::spawn(move || {
+                    let result = yt.radio(&item.video_id);
+                    let _ = sender.send(Event::StartedRadio(item, result, mix));
+                });
             }
             Action::Jump(index) => playback.play_index(index),
             Action::PlayNext(item) => playback.play_next(item),
