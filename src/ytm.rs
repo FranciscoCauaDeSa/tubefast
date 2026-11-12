@@ -1,11 +1,10 @@
-use crate::auth;
+use crate::{auth, romanize};
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MUSIC_API: &str = "https://music.youtube.com/youtubei/v1/";
@@ -49,7 +48,10 @@ const HOME_ORDER: usize = 200;
 const PERSONAL_PAGES: usize = 3;
 const LIKED_SONGS: &str = "VLLM";
 const TRACK_PAGES: usize = 50;
-const SESSION_REJECTED: &str = "YouTube did not accept this sign-in. Sign in again.";
+const REJECTION_RECHECK_DELAY: Duration = Duration::from_secs(2);
+const REJECTION_CONFIRM_AFTER: Duration = Duration::from_secs(30);
+const REJECTION_STALE_AFTER: Duration = Duration::from_secs(600);
+const SESSION_REJECTED: &str = "Your saved sign-in has probably expired. Sign in again, preferably with browser login.";
 const UNUSED_KEYS: [&str; 14] = [
     "counterpart",
     "menu",
@@ -91,6 +93,15 @@ impl Item {
     pub fn key(&self) -> &str {
         if self.is_song() { &self.video_id } else { &self.browse_id }
     }
+
+    pub fn credit(&self) -> &str {
+        let mut parts = self.subtitle.split(" • ");
+        let named = self
+            .artists
+            .first()
+            .and_then(|(name, _)| parts.clone().find(|part| part.contains(name.as_str())));
+        named.or_else(|| parts.next()).unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,11 +112,19 @@ pub enum Layout {
     Top,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Target {
+    pub browse_id: String,
+    pub params: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Section {
     pub title: String,
     pub layout: Layout,
     pub items: Vec<Item>,
+    pub all: Option<Target>,
+    pub brief: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,8 +157,21 @@ pub struct Stream {
 #[derive(Debug, PartialEq)]
 pub struct Lyrics {
     pub lines: Vec<(u64, String)>,
+    pub romanized: Vec<Option<String>>,
     pub synced: bool,
     pub source: String,
+}
+
+impl Lyrics {
+    fn new(lines: Vec<(u64, String)>, synced: bool, source: String) -> Self {
+        let romanized = lines.iter().map(|(_, line)| romanize::romanize_line(line)).collect();
+        Self {
+            lines,
+            romanized,
+            synced,
+            source,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -180,7 +212,8 @@ pub struct Client {
     visitor: Mutex<String>,
     session: Mutex<Option<String>>,
     page: Mutex<String>,
-    expired: AtomicBool,
+    expired: Mutex<Option<String>>,
+    first_unauthorized: Mutex<Option<Instant>>,
     clients: Mutex<Clients>,
     clients_checked: Mutex<Option<Instant>>,
 }
@@ -197,7 +230,8 @@ impl Client {
             visitor: Mutex::new(visitor),
             session: Mutex::new(None),
             page: Mutex::default(),
-            expired: AtomicBool::new(false),
+            expired: Mutex::new(None),
+            first_unauthorized: Mutex::default(),
             clients: Mutex::new(Clients::parse(BUNDLED_CLIENTS).expect("the bundled clients.json should be complete")),
             clients_checked: Mutex::new(None),
         }
@@ -233,6 +267,8 @@ impl Client {
     }
 
     pub fn set_session(&self, cookie: Option<String>) {
+        self.expired.lock().unwrap().take();
+        *self.first_unauthorized.lock().unwrap() = None;
         *self.session.lock().unwrap() = cookie;
     }
 
@@ -240,12 +276,33 @@ impl Client {
         *self.page.lock().unwrap() = page.to_owned();
     }
 
+    pub fn session(&self) -> Option<String> {
+        self.session.lock().unwrap().clone()
+    }
+
+    fn rotate(&self, used: &str, set_cookies: &[&str]) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64);
+        let mut session = self.session.lock().unwrap();
+        let Some(merged) = session
+            .as_deref()
+            .filter(|current| auth::same_login(current, used))
+            .and_then(|current| auth::merge_set_cookies(current, set_cookies, now))
+        else {
+            return;
+        };
+        *session = Some(merged);
+        drop(session);
+        auth::persist_rotation(used, set_cookies, now);
+    }
+
     pub fn signed_in(&self) -> bool {
         self.session.lock().unwrap().is_some()
     }
 
-    pub fn take_expired(&self) -> bool {
-        self.expired.swap(false, Relaxed)
+    pub fn take_expired(&self) -> Option<String> {
+        self.expired.lock().unwrap().take()
     }
 
     pub fn sign_in(&self, cookie: String) -> Result<Account, String> {
@@ -254,14 +311,22 @@ impl Client {
         let account = self.account();
         if account.is_err() {
             self.set_session(None);
-            self.expired.store(false, Relaxed);
+            self.expired.lock().unwrap().take();
         }
         account
     }
 
+    pub fn current_account(&self) -> Result<Account, String> {
+        self.account()
+    }
+
     fn account(&self) -> Result<Account, String> {
         let used = self.session.lock().unwrap().clone().unwrap_or_default();
-        let response = self.music("account/account_menu", json!({}), &[])?;
+        let mut response = self.music("account/account_menu", json!({}), &[])?;
+        if find(&response, "activeAccountHeaderRenderer").is_none() {
+            std::thread::sleep(REJECTION_RECHECK_DELAY);
+            response = self.music("account/account_menu", json!({}), &[])?;
+        }
         let Some(header) = find(&response, "activeAccountHeaderRenderer") else {
             self.end_session(&used);
             return Err(SESSION_REJECTED.to_owned());
@@ -282,11 +347,26 @@ impl Client {
         Ok(channels(&self.music("account/accounts_list", body, &[])?))
     }
 
+    fn judge_unauthorized(&self, cookie: &str, signal: Signal) {
+        let mut since = self.first_unauthorized.lock().unwrap();
+        let now = Instant::now();
+        match judge(*since, now, signal) {
+            Verdict::Reset => *since = None,
+            Verdict::Wait => {}
+            Verdict::Start => *since = Some(now),
+            Verdict::End => {
+                *since = None;
+                drop(since);
+                self.end_session(cookie);
+            }
+        }
+    }
+
     fn end_session(&self, rejected: &str) {
         let mut session = self.session.lock().unwrap();
         if session.as_deref() == Some(rejected) {
             *session = None;
-            self.expired.store(true, Relaxed);
+            *self.expired.lock().unwrap() = Some(rejected.to_owned());
         }
     }
 
@@ -386,6 +466,8 @@ impl Client {
                                     title: format!("More like {}", seed.title),
                                     layout: Layout::Compact,
                                     items,
+                                    all: None,
+                                    brief: None,
                                 }],
                             );
                         }
@@ -430,6 +512,28 @@ impl Client {
         page.partial = false;
         inherit_header(&mut page);
         Ok(page)
+    }
+
+    pub fn full_section(&self, target: &Target) -> Result<Vec<Item>, String> {
+        let mut body = json!({ "browseId": target.browse_id });
+        if !target.params.is_empty() {
+            body["params"] = json!(target.params);
+        }
+        let response = self.music("browse", body, &[])?;
+        let mut token = tracks_continuation(&response);
+        let mut items = parse_page(&response)
+            .sections
+            .into_iter()
+            .next()
+            .map(|s| s.items)
+            .unwrap_or_default();
+        for _ in 1..TRACK_PAGES {
+            let Some(next) = token.take() else { break };
+            let Ok(response) = self.more(&next) else { break };
+            items.extend(parse_page(&response).songs());
+            token = continuation(&response);
+        }
+        Ok(items)
     }
 
     pub fn search(&self, query: &str) -> Result<Page, String> {
@@ -620,14 +724,27 @@ impl Client {
                 .set("X-Origin", auth::ORIGIN)
                 .set("X-Goog-AuthUser", "0");
         }
-        let response = match request.send_json(body) {
-            Ok(response) => read(response)?,
+        let mut outcome = request.clone().send_json(body.clone());
+        if cookie.is_some() && is_unauthorized(&outcome) {
+            std::thread::sleep(REJECTION_RECHECK_DELAY);
+            outcome = request.send_json(body);
+        }
+        let response = match outcome {
+            Ok(response) => {
+                if let Some(used) = &cookie {
+                    self.rotate(used, &response.all("set-cookie"));
+                }
+                read(response)?
+            }
             Err(ureq::Error::Status(401, _)) if cookie.is_some() => {
-                self.end_session(&cookie.unwrap_or_default());
+                self.judge_unauthorized(&cookie.unwrap_or_default(), Signal::Rejected);
                 return Err(SESSION_REJECTED.to_owned());
             }
             Err(error) => return Err(describe(error)),
         };
+        if cookie.is_some() {
+            self.judge_unauthorized("", Signal::Accepted);
+        }
         if let Some(visitor) = response["responseContext"]["visitorData"].as_str() {
             let mut known = self.visitor.lock().unwrap();
             if known.is_empty() {
@@ -636,6 +753,34 @@ impl Client {
         }
         Ok(response)
     }
+}
+
+#[derive(Clone, Copy)]
+enum Signal {
+    Rejected,
+    Accepted,
+}
+
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Wait,
+    Start,
+    End,
+    Reset,
+}
+
+fn judge(first_rejection: Option<Instant>, now: Instant, signal: Signal) -> Verdict {
+    match (signal, first_rejection.map(|first| now.saturating_duration_since(first))) {
+        (Signal::Accepted, _) => Verdict::Reset,
+        (Signal::Rejected, Some(age)) if age >= REJECTION_STALE_AFTER => Verdict::Start,
+        (Signal::Rejected, Some(age)) if age >= REJECTION_CONFIRM_AFTER => Verdict::End,
+        (Signal::Rejected, Some(_)) => Verdict::Wait,
+        (Signal::Rejected, None) => Verdict::Start,
+    }
+}
+
+fn is_unauthorized(outcome: &Result<ureq::Response, ureq::Error>) -> bool {
+    matches!(outcome, Err(ureq::Error::Status(401, _)))
 }
 
 fn send(request: ureq::Request, body: Value) -> Result<Value, String> {
@@ -692,11 +837,7 @@ fn timed_lyrics(response: &Value) -> Option<Lyrics> {
         })
         .collect();
     let source = find(response, "sourceMessage").and_then(Value::as_str).unwrap_or_default();
-    (!lines.is_empty()).then(|| Lyrics {
-        lines,
-        synced: true,
-        source: source.to_owned(),
-    })
+    (!lines.is_empty()).then(|| Lyrics::new(lines, true, source.to_owned()))
 }
 
 fn lrclib_lyrics(found: &Value) -> Option<Lyrics> {
@@ -713,22 +854,14 @@ fn lrclib_lyrics(found: &Value) -> Option<Lyrics> {
         let plain = found["plainLyrics"].as_str().unwrap_or_default();
         lines = plain.lines().map(|line| (0, line.trim().to_owned())).collect();
     }
-    (!lines.is_empty()).then(|| Lyrics {
-        lines,
-        synced,
-        source: LRCLIB_SOURCE.to_owned(),
-    })
+    (!lines.is_empty()).then(|| Lyrics::new(lines, synced, LRCLIB_SOURCE.to_owned()))
 }
 
 fn plain_lyrics(response: &Value) -> Option<Lyrics> {
     let shelf = find(response, "musicDescriptionShelfRenderer")?;
     let words = text(&shelf["description"]);
     let lines: Vec<(u64, String)> = words.lines().map(|line| (0, line.trim().to_owned())).collect();
-    (!lines.is_empty()).then(|| Lyrics {
-        lines,
-        synced: false,
-        source: text(&shelf["footer"]),
-    })
+    (!lines.is_empty()).then(|| Lyrics::new(lines, false, text(&shelf["footer"])))
 }
 
 fn single_song_cover(watch_page: &str) -> String {
@@ -930,6 +1063,8 @@ fn collect(node: &Value, page: &mut Page) {
                             title: String::new(),
                             layout: Layout::Tracks,
                             items: Vec::new(),
+                            all: None,
+                            brief: None,
                         });
                     }
                     page.sections.last_mut().unwrap().items.extend(item(child));
@@ -968,7 +1103,29 @@ fn shelf(kind: &str, node: &Value) -> Section {
         }
         _ => (text(&node["title"]), Layout::Tracks),
     };
-    Section { title, layout, items }
+    let all = match kind {
+        "musicCarouselShelfRenderer" => target(
+            node,
+            "/header/musicCarouselShelfBasicHeaderRenderer/moreContentButton/buttonRenderer/navigationEndpoint",
+        ),
+        "musicShelfRenderer" => target(node, "/bottomEndpoint").or_else(|| target(node, "/title/runs/0/navigationEndpoint")),
+        _ => None,
+    };
+    Section {
+        title,
+        layout,
+        items,
+        all,
+        brief: None,
+    }
+}
+
+fn target(node: &Value, endpoint: &str) -> Option<Target> {
+    let browse = node.pointer(endpoint)?.get("browseEndpoint")?;
+    Some(Target {
+        browse_id: browse["browseId"].as_str().filter(|id| !id.is_empty())?.to_owned(),
+        params: browse["params"].as_str().unwrap_or_default().to_owned(),
+    })
 }
 
 fn card(node: &Value) -> Item {
@@ -1231,6 +1388,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_credit_names_the_artists_without_the_view_count() {
+        let song = |subtitle: &str, artist: &str| Item {
+            subtitle: subtitle.to_owned(),
+            artists: vec![(artist.to_owned(), String::new())],
+            ..Item::default()
+        };
+        assert_eq!(song("Adele fasbrasil • 5.9M views", "Adele fasbrasil").credit(), "Adele fasbrasil");
+        assert_eq!(song("Video • Prince • 12M views", "Prince").credit(), "Prince");
+        assert_eq!(song("Daft Punk • Random Access Memories", "").credit(), "Daft Punk");
+    }
+
+    #[test]
+    fn shelves_expose_where_the_full_list_lives() {
+        let song = |id: &str| json!({ "musicResponsiveListItemRenderer": { "title": { "runs": [{ "text": id }] }, "playlistItemData": { "videoId": id } } });
+        let response = json!({ "contents": [
+            { "musicShelfRenderer": {
+                "title": { "runs": [{ "text": "Songs" }] },
+                "contents": [song("a")],
+                "bottomEndpoint": { "browseEndpoint": { "browseId": "VLOLAK5uy_x" } },
+            } },
+            { "musicCarouselShelfRenderer": {
+                "header": { "musicCarouselShelfBasicHeaderRenderer": {
+                    "title": { "runs": [{ "text": "Albums" }] },
+                    "moreContentButton": { "buttonRenderer": { "navigationEndpoint": {
+                        "browseEndpoint": { "browseId": "MPADUC123", "params": "ggMCEgA" },
+                    } } },
+                } },
+                "contents": [{ "musicTwoRowItemRenderer": { "title": { "runs": [{ "text": "One" }] }, "navigationEndpoint": { "browseEndpoint": { "browseId": "MPREb_One" } } } }],
+            } },
+            { "musicCarouselShelfRenderer": {
+                "header": { "musicCarouselShelfBasicHeaderRenderer": { "title": { "runs": [{ "text": "Fans also like" }] } } },
+                "contents": [{ "musicTwoRowItemRenderer": { "title": { "runs": [{ "text": "Two" }] }, "navigationEndpoint": { "browseEndpoint": { "browseId": "MPREb_Two" } } } }],
+            } },
+        ] });
+        let sections = parse_page(&response).sections;
+        let targets: Vec<_> = sections.iter().map(|s| s.all.clone()).collect();
+        let songs = Target {
+            browse_id: "VLOLAK5uy_x".into(),
+            params: String::new(),
+        };
+        let albums = Target {
+            browse_id: "MPADUC123".into(),
+            params: "ggMCEgA".into(),
+        };
+        assert_eq!(targets, vec![Some(songs), Some(albums), None]);
+    }
+
+    #[test]
     fn prefers_opus_and_falls_back_to_aac() {
         let format = |itag: u64| json!({ "itag": itag, "url": format!("https://x/{itag}"), "contentLength": "10" });
         let response = |itags: &[u64]| {
@@ -1279,11 +1484,45 @@ mod tests {
         let yt = Client::new(String::new());
         yt.set_session(Some("newer".to_owned()));
         yt.end_session("older");
-        assert!(yt.signed_in() && !yt.take_expired());
+        assert!(yt.signed_in() && yt.take_expired().is_none());
         yt.end_session("newer");
-        assert!(!yt.signed_in() && yt.take_expired());
+        assert!(!yt.signed_in() && yt.take_expired().as_deref() == Some("newer"));
         yt.end_session("");
-        assert!(!yt.take_expired());
+        assert!(yt.take_expired().is_none());
+    }
+
+    #[test]
+    fn ends_the_session_only_on_a_rejection_after_the_window() {
+        let first = Instant::now();
+        let inside = first + REJECTION_CONFIRM_AFTER / 2;
+        let after = first + REJECTION_CONFIRM_AFTER;
+        assert_eq!(judge(None, first, Signal::Rejected), Verdict::Start);
+        assert_eq!(judge(Some(first), first + REJECTION_STALE_AFTER, Signal::Rejected), Verdict::Start);
+        assert_eq!(judge(Some(first), inside, Signal::Rejected), Verdict::Wait);
+        assert_eq!(judge(Some(first), after, Signal::Rejected), Verdict::End);
+        assert_eq!(judge(Some(first), after, Signal::Accepted), Verdict::Reset);
+        assert_eq!(judge(None, after, Signal::Accepted), Verdict::Reset);
+    }
+
+    #[test]
+    fn a_new_session_forgets_earlier_rejections() {
+        let yt = Client::new(String::new());
+        yt.set_session(Some("old".to_owned()));
+        yt.end_session("old");
+        yt.judge_unauthorized("new", Signal::Rejected);
+        yt.set_session(Some("new".to_owned()));
+        assert!(yt.take_expired().is_none());
+        assert!(yt.first_unauthorized.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn only_a_401_counts_as_a_rejected_session() {
+        let status = |code| Err(ureq::Error::Status(code, ureq::Response::new(code, "status", "").unwrap()));
+        assert!(is_unauthorized(&status(401)));
+        assert!(!is_unauthorized(&status(403)));
+        assert!(!is_unauthorized(&status(500)));
+        assert!(!is_unauthorized(&status(503)));
+        assert!(!is_unauthorized(&Ok(ureq::Response::new(200, "OK", "").unwrap())));
     }
 
     #[test]

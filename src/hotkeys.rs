@@ -1,11 +1,13 @@
 use crate::app::Action;
 use eframe::egui::{Key, Modifiers};
+use serde::de::{Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 pub const ALT: u8 = 1;
 pub const CTRL: u8 = 2;
 pub const SHIFT: u8 = 4;
-pub const SUPPORTED: bool = cfg!(windows);
+pub const COUNT: usize = 6;
 const VOLUME_STEP: f32 = 0.05;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -15,15 +17,17 @@ pub enum Command {
     Previous,
     VolumeUp,
     VolumeDown,
+    Overlay,
 }
 
 impl Command {
-    pub const ALL: [Command; 5] = [
+    pub const ALL: [Command; COUNT] = [
         Command::PlayPause,
         Command::Next,
         Command::Previous,
         Command::VolumeUp,
         Command::VolumeDown,
+        Command::Overlay,
     ];
 
     pub fn name(self) -> &'static str {
@@ -33,6 +37,7 @@ impl Command {
             Command::Previous => "Previous song",
             Command::VolumeUp => "Volume up",
             Command::VolumeDown => "Volume down",
+            Command::Overlay => "Show / hide overlay",
         }
     }
 
@@ -43,6 +48,7 @@ impl Command {
             Command::Previous => Action::Previous,
             Command::VolumeUp => Action::VolumeBy(VOLUME_STEP),
             Command::VolumeDown => Action::VolumeBy(-VOLUME_STEP),
+            Command::Overlay => Action::ToggleOverlay,
         }
     }
 
@@ -53,6 +59,7 @@ impl Command {
             Command::Previous => 0x25,
             Command::VolumeUp => 0x26,
             Command::VolumeDown => 0x28,
+            Command::Overlay => 0x4F,
         };
         Combo { mods: CTRL | ALT, vk }
     }
@@ -63,8 +70,33 @@ impl Command {
     }
 }
 
-pub fn standard_combos() -> [Option<Combo>; 5] {
+pub fn standard_combos() -> [Option<Combo>; COUNT] {
     Command::ALL.map(|command| Some(command.standard()))
+}
+
+struct PaddedCombos;
+
+impl<'de> Visitor<'de> for PaddedCombos {
+    type Value = [Option<Combo>; COUNT];
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a list of hotkey combos")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut combos = standard_combos();
+        for slot in &mut combos {
+            match seq.next_element()? {
+                Some(stored) => *slot = stored,
+                None => break,
+            }
+        }
+        Ok(combos)
+    }
+}
+
+pub fn padded_combos<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[Option<Combo>; COUNT], D::Error> {
+    deserializer.deserialize_tuple(COUNT, PaddedCombos)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,12 +239,197 @@ impl Drop for Hotkeys {
     }
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+mod portal;
+
 #[cfg(not(windows))]
-pub struct Hotkeys;
+pub enum Hotkeys {
+    Grabbed {
+        manager: global_hotkey::GlobalHotKeyManager,
+        registered: Vec<global_hotkey::hotkey::HotKey>,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    Portal(#[allow(dead_code)] async_channel::Sender<()>),
+}
+
+#[cfg(not(windows))]
+fn code_name(vk: u32) -> Option<String> {
+    let name = match vk {
+        0x09 => "Tab".to_owned(),
+        0x0D => "Enter".to_owned(),
+        0x20 => "Space".to_owned(),
+        0x21 => "PageUp".to_owned(),
+        0x22 => "PageDown".to_owned(),
+        0x23 => "End".to_owned(),
+        0x24 => "Home".to_owned(),
+        0x25 => "ArrowLeft".to_owned(),
+        0x26 => "ArrowUp".to_owned(),
+        0x27 => "ArrowRight".to_owned(),
+        0x28 => "ArrowDown".to_owned(),
+        0x2D => "Insert".to_owned(),
+        0x30..=0x39 => format!("Digit{}", vk - 0x30),
+        0x41..=0x5A => format!("Key{}", char::from_u32(vk)?),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        _ => return None,
+    };
+    Some(name)
+}
+
+#[cfg(not(windows))]
+fn hotkey_of(combo: Combo) -> Option<global_hotkey::hotkey::HotKey> {
+    use global_hotkey::hotkey::{Code, HotKey, Modifiers as Held};
+    let held = [(ALT, Held::ALT), (CTRL, Held::CONTROL), (SHIFT, Held::SHIFT)]
+        .into_iter()
+        .filter(|(bit, _)| combo.mods & bit != 0)
+        .fold(Held::empty(), |held, (_, modifier)| held | modifier);
+    Some(HotKey::new(Some(held), code_name(combo.vk)?.parse::<Code>().ok()?))
+}
+
+#[cfg(not(windows))]
+fn wayland_session() -> bool {
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
+    std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn through_portal() -> bool {
+    wayland_session() && !portal::refused()
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn through_portal() -> bool {
+    false
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn portal_trigger(command: Command) -> Option<String> {
+    portal::trigger(command)
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn portal_trigger(_: Command) -> Option<String> {
+    None
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn layer_overlay() -> bool {
+    wayland_session() && crate::overlay_wayland::supported()
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn layer_overlay() -> bool {
+    false
+}
+
+pub fn listed() -> Vec<Command> {
+    Command::ALL
+        .into_iter()
+        .filter(|command| *command != Command::Overlay || !through_portal() || layer_overlay())
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn unavailable() -> Option<&'static str> {
+    if cfg!(target_os = "macos") || through_portal() {
+        None
+    } else if wayland_session() {
+        Some(
+            "This desktop does not offer global shortcuts on Wayland, so Tubefast cannot listen for hotkeys here. The media keys on your keyboard (play, pause, next, previous) still work.",
+        )
+    } else if std::env::var_os("DISPLAY").is_none() {
+        Some("No X11 display was found")
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+pub fn unavailable() -> Option<&'static str> {
+    None
+}
 
 #[cfg(not(windows))]
 impl Hotkeys {
-    pub fn start(_: Vec<(Command, Combo)>, _: impl Fn(Command) + Send + 'static) -> Option<(Self, Vec<Command>)> {
-        None
+    pub fn start(bindings: Vec<(Command, Combo)>, press: impl Fn(Command) + Send + 'static) -> Option<(Self, Vec<Command>)> {
+        use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+
+        if unavailable().is_some() {
+            return None;
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if through_portal() {
+            return Some((Self::Portal(portal::start(bindings, press)?), Vec::new()));
+        }
+        let manager = GlobalHotKeyManager::new().ok()?;
+        let (mut registered, mut taken, mut commands) = (Vec::new(), Vec::new(), Vec::new());
+        for (command, combo) in bindings {
+            match hotkey_of(combo) {
+                Some(hotkey) if manager.register(hotkey).is_ok() => {
+                    commands.push((hotkey.id(), command));
+                    registered.push(hotkey);
+                }
+                _ => taken.push(command),
+            }
+        }
+        let press = std::sync::Mutex::new(press);
+        GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+            if event.state() != HotKeyState::Pressed {
+                return;
+            }
+            if let Some((_, command)) = commands.iter().find(|(id, _)| *id == event.id())
+                && let Ok(press) = press.lock()
+            {
+                press(*command);
+            }
+        }));
+        Some((Self::Grabbed { manager, registered }, taken))
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for Hotkeys {
+    fn drop(&mut self) {
+        match self {
+            Self::Grabbed { manager, registered } => {
+                global_hotkey::GlobalHotKeyEvent::set_event_handler(None::<fn(global_hotkey::GlobalHotKeyEvent)>);
+                let _ = manager.unregister_all(registered);
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Self::Portal(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct Stored {
+        #[serde(deserialize_with = "padded_combos")]
+        combos: [Option<Combo>; COUNT],
+    }
+
+    #[test]
+    fn overlay_command_toggles_the_overlay() {
+        assert!(matches!(Command::Overlay.action(), Action::ToggleOverlay));
+        assert!(Command::ALL[Command::Overlay as usize] == Command::Overlay);
+    }
+
+    #[test]
+    fn standard_combos_never_collide() {
+        let combos = standard_combos();
+        for (at, combo) in combos.iter().enumerate() {
+            assert!(!combos[at + 1..].contains(combo));
+        }
+    }
+
+    #[test]
+    fn saves_from_before_the_overlay_keep_their_combos_and_get_the_standard_one() {
+        let old = r#"{"combos":[null,{"mods":2,"vk":65},null,null,null]}"#;
+        let stored: Stored = serde_json::from_str(old).unwrap();
+        assert!(stored.combos[0].is_none());
+        assert!(stored.combos[1] == Some(Combo { mods: CTRL, vk: 65 }));
+        assert!(stored.combos[Command::Overlay as usize] == Some(Command::Overlay.standard()));
     }
 }

@@ -1,2 +1,2 @@
-- Repeat and the next song keep working while the window is minimized, also on Linux with Wayland
-- After an update, a small card at the bottom left shows what is new
+- Sign in with Brave Origin or Helium on Linux as well
+- The media overlay now also works on Linux Wayland desktops that support layer shell, such as KDE Plasma, Sway and Hyprland. It does not work on GNOME, and Settings says so

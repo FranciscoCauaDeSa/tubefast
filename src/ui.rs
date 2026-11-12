@@ -1,8 +1,10 @@
-use crate::app::{Action, App, Covers, Load, Repeat, Route, Words};
+use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, Words, usable_opacity};
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
-use crate::ytm::{Item, Layout};
+#[cfg(all(unix, not(target_os = "macos")))]
+use crate::overlay_wayland;
+use crate::ytm::{Item, Layout, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::epaint::{RectShape, Shadow};
@@ -61,6 +63,15 @@ const SETTING_ROW: f32 = 48.0;
 const HOTKEY_ROW: f32 = 56.0;
 const STATUS_ROW: f32 = 26.0;
 const SECTION_GAP: f32 = 32.0;
+const OVERLAY_TITLE: &str = "Tubefast overlay";
+const OVERLAY_CLOSE_DIM: f32 = 0.22;
+pub const OVERLAY_WIDTH: f32 = 340.0;
+const OVERLAY_HOME: [f32; 2] = [24.0, 24.0];
+const OVERLAY_ROWS: usize = 4;
+const OVERLAY_ROW: f32 = 48.0;
+const OVERLAY_PAD: f32 = 14.0;
+const OVERLAY_ART: f32 = 56.0;
+const SLIDER_WIDTH: f32 = 160.0;
 const CARD_PAD: f32 = 6.0;
 const CARD_RADIUS: f32 = 12.0;
 
@@ -398,6 +409,7 @@ struct Cx<'a> {
     liked: &'a [Item],
     playlists: &'a [Item],
     single: bool,
+    loading_sections: Vec<usize>,
     out: &'a mut Vec<Action>,
 }
 
@@ -506,16 +518,22 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
             .show_separator_line(false)
             .frame(plain(PANEL))
             .show(ctx, |ui| sidebar(app, ui, &mut out));
-        let queue_fits = app.saved.queue_open && ctx.content_rect().width() >= QUEUE_MIN_WINDOW;
+        let queue_wanted = app.saved.queue_open;
+        let queue_fits = queue_wanted && ctx.content_rect().width() >= QUEUE_MIN_WINDOW;
+        let queue_instead = queue_wanted && !queue_fits;
         egui::SidePanel::right("queue")
             .exact_width(QUEUE_WIDTH)
             .resizable(false)
             .show_separator_line(false)
             .frame(plain(PANEL))
             .show_animated(ctx, queue_fits, |ui| queue_panel(app, ui, &mut out));
-        egui::CentralPanel::default()
-            .frame(plain(BASE))
-            .show(ctx, |ui| content(app, ui, &mut out));
+        egui::CentralPanel::default().frame(plain(BASE)).show(ctx, |ui| {
+            if queue_instead {
+                queue_panel(app, ui, &mut out);
+            } else {
+                content(app, ui, &mut out);
+            }
+        });
     }
     app.title_bar.paint(frame);
     paint_scrubber(ctx, &scrub);
@@ -523,6 +541,366 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     notice(app, ctx, &mut out);
     release_notes(app, ctx, &mut out);
     out
+}
+
+#[derive(Clone, PartialEq)]
+pub struct OverlayEntry {
+    pub index: usize,
+    pub title: String,
+    pub subtitle: String,
+    pub cover: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct OverlayView {
+    pub controls: bool,
+    pub playing: bool,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+    pub track: Option<OverlayEntry>,
+    pub next_up: Vec<OverlayEntry>,
+}
+
+impl OverlayView {
+    fn of(app: &App) -> Self {
+        let entry = |index: usize, item: &Item| OverlayEntry {
+            index,
+            title: item.title.clone(),
+            subtitle: item.subtitle.clone(),
+            cover: app.saved.covers.of(item).to_owned(),
+        };
+        let upcoming = overlay_upcoming(app);
+        let rows = if app.saved.overlay_next_up {
+            app.saved.queue.len().saturating_sub(upcoming).min(OVERLAY_ROWS)
+        } else {
+            0
+        };
+        Self {
+            controls: app.saved.overlay_controls,
+            playing: app.playing(),
+            position_ms: app.player.position_ms(),
+            duration_ms: app.player.duration_ms(),
+            track: app
+                .saved
+                .current
+                .and_then(|current| Some(entry(current, app.saved.queue.get(current)?))),
+            next_up: (upcoming..upcoming + rows)
+                .map(|index| entry(index, &app.saved.queue[index]))
+                .collect(),
+        }
+    }
+
+    pub fn height(&self) -> f32 {
+        overlay_height(self.next_up.len(), self.controls)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn draw_overlay_card(ctx: &egui::Context, view: &OverlayView, art: &Art, opacity: f32) -> Vec<Action> {
+    let mut out = Vec::new();
+    egui::CentralPanel::default().frame(Frame::NONE).show(ctx, |ui| {
+        ui.multiply_opacity(opacity);
+        overlay_card(view, art, ui, &mut out);
+    });
+    out
+}
+
+pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
+    let mut out = Vec::new();
+    let open = app.saved.overlay && app.overlay_open;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if hotkeys::layer_overlay() {
+        return layer_overlay(app, ctx, open);
+    }
+    if !open {
+        forget_overlay_window();
+        return out;
+    }
+    let home = app.overlay_origin.unwrap_or(OVERLAY_HOME);
+    let saved = app.saved.overlay_position.unwrap_or(OVERLAY_HOME);
+    let builder = egui::ViewportBuilder::default()
+        .with_title(OVERLAY_TITLE)
+        .with_inner_size([OVERLAY_WIDTH, OverlayView::of(app).height()])
+        .with_position(home)
+        .with_decorations(false)
+        .with_always_on_top()
+        .with_transparent(!cfg!(windows))
+        .with_taskbar(false)
+        .with_resizable(false)
+        .with_active(false);
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("overlay"), builder, |ctx, _| {
+        style_overlay_window(ctx, usable_opacity(app.saved.overlay_opacity));
+        egui::CentralPanel::default().frame(Frame::NONE).show(ctx, |ui| {
+            if !cfg!(windows) {
+                ui.multiply_opacity(usable_opacity(app.saved.overlay_opacity));
+            }
+            overlay_card(&OverlayView::of(app), &app.art, ui, &mut out);
+        });
+        let (outer, closing) = ctx.input(|input| (input.viewport().outer_rect, input.viewport().close_requested()));
+        let near = |target: [f32; 2]| outer.is_some_and(|outer| (outer.min - pos2(target[0], target[1])).length() <= 1.0);
+        if app.overlay_snapping {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(OVERLAY_HOME[0], OVERLAY_HOME[1])));
+            ctx.request_repaint();
+            if near(OVERLAY_HOME) {
+                out.push(Action::OverlaySnapped);
+            }
+        } else if let (Some(outer), false) = (outer, near(saved)) {
+            out.push(Action::OverlayMoved([outer.min.x, outer.min.y]));
+        }
+        if closing {
+            out.push(Action::ToggleOverlay);
+        }
+    });
+    out
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn layer_overlay(app: &App, ctx: &egui::Context, open: bool) -> Vec<Action> {
+    if !open {
+        if let Some(Some(handle)) = app.layer_overlay.get() {
+            handle.hide();
+        }
+        return Vec::new();
+    }
+    let started = app
+        .layer_overlay
+        .get_or_init(|| overlay_wayland::Handle::start(ctx.clone(), app.http_agent()));
+    let Some(handle) = started else {
+        return vec![Action::ToggleOverlay];
+    };
+    handle.show(overlay_wayland::Frame {
+        view: OverlayView::of(app),
+        opacity: usable_opacity(app.saved.overlay_opacity),
+        position: app.saved.overlay_position.unwrap_or(OVERLAY_HOME),
+    });
+    let mut out = handle.actions();
+    if app.overlay_snapping {
+        out.push(Action::OverlaySnapped);
+    }
+    out
+}
+
+#[cfg(windows)]
+static OVERLAY_WINDOW: std::sync::Mutex<(isize, u8)> = std::sync::Mutex::new((0, 0));
+
+#[cfg(windows)]
+fn own_overlay_window() -> Option<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
+    let title: Vec<u16> = OVERLAY_TITLE.encode_utf16().chain([0]).collect();
+    let mut window = std::ptr::null_mut();
+    loop {
+        window = unsafe { FindWindowExW(std::ptr::null_mut(), window, std::ptr::null(), title.as_ptr()) };
+        if window.is_null() {
+            return None;
+        }
+        let mut owner = 0;
+        unsafe { GetWindowThreadProcessId(window, &mut owner) };
+        if owner == unsafe { GetCurrentProcessId() } {
+            return Some(window);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn style_overlay_window(ctx: &egui::Context, opacity: f32) {
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongPtrW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    };
+    let alpha = (opacity * 255.0) as u8;
+    let mut styled = OVERLAY_WINDOW.lock().unwrap();
+    if styled.0 != 0 && styled.1 == alpha {
+        return;
+    }
+    let window = if styled.0 != 0 { Some(styled.0 as _) } else { own_overlay_window() };
+    let Some(window) = window else {
+        ctx.request_repaint();
+        return;
+    };
+    unsafe {
+        if styled.0 == 0 {
+            let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+            SetWindowLongPtrW(window, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE | WS_EX_LAYERED) as isize);
+            let corners = DWMWCP_ROUND;
+            DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE as u32, (&raw const corners).cast(), 4);
+        }
+        SetLayeredWindowAttributes(window, 0, alpha, LWA_ALPHA);
+    }
+    *styled = (window as isize, alpha);
+}
+
+#[cfg(windows)]
+fn forget_overlay_window() {
+    *OVERLAY_WINDOW.lock().unwrap() = (0, 0);
+}
+
+#[cfg(not(windows))]
+fn style_overlay_window(_: &egui::Context, _: f32) {}
+
+#[cfg(not(windows))]
+fn forget_overlay_window() {}
+
+#[cfg(windows)]
+fn cursor_in_points(ctx: &egui::Context) -> Option<Pos2> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut cursor = POINT { x: 0, y: 0 };
+    (unsafe { GetCursorPos(&mut cursor) } != 0).then(|| pos2(cursor.x as f32, cursor.y as f32) / ctx.pixels_per_point())
+}
+
+#[cfg(not(windows))]
+fn cursor_in_points(_: &egui::Context) -> Option<Pos2> {
+    None
+}
+
+fn overlay_upcoming(app: &App) -> usize {
+    app.saved.current.map_or(0, |current| current + 1)
+}
+
+fn overlay_base_height(controls: bool) -> f32 {
+    2.0 * OVERLAY_PAD + OVERLAY_ART + 38.0 + if controls { 28.0 } else { 0.0 }
+}
+
+fn overlay_height(rows: usize, controls: bool) -> f32 {
+    let queue_height = if rows > 0 { 28.0 + rows as f32 * OVERLAY_ROW } else { 0.0 };
+    overlay_base_height(controls) + queue_height
+}
+
+fn overlay_card(view: &OverlayView, art: &Art, ui: &mut Ui, out: &mut Vec<Action>) {
+    let rows = view.next_up.len();
+    let controls = view.controls;
+    let height = overlay_height(rows, controls);
+    let area = ui.max_rect();
+    let card = Rect::from_min_size(area.min, vec2(area.width(), height));
+    ui.painter().rect(card, 8.0, PANEL, Stroke::new(1.0, veil(0.1)), StrokeKind::Inside);
+    let drag = ui.interact(card, Id::new("overlay-drag"), Sense::drag());
+    let grip = Id::new("overlay-grip");
+    let outer = ui.ctx().input(|input| input.viewport().outer_rect);
+    if drag.drag_started() && !cfg!(windows) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    if let (true, Some(cursor), Some(outer)) = (drag.drag_started(), cursor_in_points(ui.ctx()), outer) {
+        ui.data_mut(|data| data.insert_temp(grip, cursor - outer.min));
+    }
+    if let (true, Some(cursor), Some(offset)) = (
+        drag.dragged(),
+        cursor_in_points(ui.ctx()),
+        ui.data(|data| data.get_temp::<Vec2>(grip)),
+    ) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(cursor - offset));
+    }
+    let inner = card.shrink(OVERLAY_PAD);
+    let close = Rect::from_center_size(pos2(inner.right() - 12.0, inner.top() + 12.0), Vec2::splat(28.0));
+    let over_card = ui
+        .ctx()
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|pointer| card.contains(pointer));
+    let seen = ui.ctx().animate_bool_with_time(Id::new("overlay-hover"), over_card, HOVER_TIME);
+    let close_tone = MUTED.gamma_multiply(egui::lerp(OVERLAY_CLOSE_DIM..=1.0, seen));
+    if icon_button(
+        ui,
+        close,
+        Id::new("overlay-close"),
+        icon::X,
+        glyph(14.0),
+        close_tone,
+        "Hide overlay",
+    )
+    .clicked()
+    {
+        out.push(Action::ToggleOverlay);
+    }
+    let cover = Rect::from_min_size(inner.min, Vec2::splat(OVERLAY_ART));
+    let (left, width) = (cover.right() + 12.0, inner.right() - cover.right() - 52.0);
+    match &view.track {
+        Some(track) => {
+            artwork(ui, art, &track.cover, cover, 8.0);
+            let (title, byline) = (pos2(left, cover.center().y - 10.0), pos2(left, cover.center().y + 10.0));
+            label(ui, title, Align2::LEFT_CENTER, &track.title, medium(14.0), TEXT, width);
+            label(ui, byline, Align2::LEFT_CENTER, &track.subtitle, sans(12.5), MUTED, width);
+        }
+        None => {
+            ui.painter().rect_filled(cover, 8.0, RAISED);
+            let at = pos2(left, cover.center().y);
+            label(ui, at, Align2::LEFT_CENTER, "Nothing playing", medium(14.0), MUTED, width);
+        }
+    }
+
+    let (duration, position) = (view.duration_ms, view.position_ms);
+    let played = if duration > 0 {
+        (position as f32 / duration as f32).min(1.0)
+    } else {
+        0.0
+    };
+    let bar = Rect::from_min_size(pos2(inner.left(), cover.bottom() + 14.0), vec2(inner.width(), 4.0));
+    ui.painter().rect_filled(bar, 2.0, veil(0.16));
+    ui.painter()
+        .rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * played, bar.height())), 2.0, ACCENT);
+    let (start, end) = (pos2(bar.left(), bar.bottom() + 10.0), pos2(bar.right(), bar.bottom() + 10.0));
+    label(ui, start, Align2::LEFT_CENTER, &clock(position), sans(11.5), FAINT, 60.0);
+    label(ui, end, Align2::RIGHT_CENTER, &clock(duration), sans(11.5), FAINT, 60.0);
+
+    if controls {
+        overlay_controls(view, ui, out, pos2(bar.center().x, bar.bottom() + 40.0));
+    }
+
+    if rows == 0 {
+        return;
+    }
+    let heading = pos2(inner.left(), card.top() + overlay_base_height(controls) + 14.0);
+    label(ui, heading, Align2::LEFT_CENTER, "Next up", bold(12.0), FAINT, inner.width());
+    for (at, entry) in view.next_up.iter().enumerate() {
+        let top = heading.y + 14.0 + at as f32 * OVERLAY_ROW;
+        let slot = Rect::from_min_size(pos2(inner.left(), top), vec2(inner.width(), OVERLAY_ROW));
+        let response = ui.interact(slot, Id::new(("overlay-row", entry.index)), Sense::click());
+        let hover = hover_of(ui, &response);
+        let (below, width) = queue_row(ui, art, &entry.cover, &entry.title, slot.shrink2(vec2(0.0, 4.0)), hover);
+        label(ui, below, Align2::LEFT_CENTER, &entry.subtitle, sans(12.5), MUTED, width);
+        describe(&response, &entry.title);
+        if response.clicked() {
+            out.push(Action::Jump(entry.index));
+        }
+    }
+}
+
+fn overlay_controls(view: &OverlayView, ui: &Ui, out: &mut Vec<Action>, middle: Pos2) {
+    let around = |offset: f32, size: f32| Rect::from_center_size(middle + vec2(offset, 0.0), Vec2::splat(size));
+    let tone = if view.track.is_some() { TEXT } else { FAINT };
+    if icon_button(
+        ui,
+        around(-52.0, 36.0),
+        Id::new("overlay-previous"),
+        icon::SKIP_BACK,
+        solid(18.0),
+        tone,
+        "Previous",
+    )
+    .clicked()
+    {
+        out.push(Action::Previous);
+    }
+    let (symbol, hint) = if view.playing {
+        (icon::PAUSE, "Pause")
+    } else {
+        (icon::PLAY, "Play")
+    };
+    if icon_button(ui, around(0.0, 40.0), Id::new("overlay-toggle"), symbol, solid(22.0), tone, hint).clicked() {
+        out.push(Action::Toggle);
+    }
+    if icon_button(
+        ui,
+        around(52.0, 36.0),
+        Id::new("overlay-next"),
+        icon::SKIP_FORWARD,
+        solid(18.0),
+        tone,
+        "Next",
+    )
+    .clicked()
+    {
+        out.push(Action::Next);
+    }
 }
 
 fn fit(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32, rows: usize) -> Arc<Galley> {
@@ -1064,21 +1442,27 @@ fn grid(ui: &mut Ui, count: usize, columns: usize, cell: Vec2, gap: Vec2, mut pa
     }
 }
 
-fn section_view(ui: &mut Ui, cx: &mut Cx, title: &str, layout: Layout, items: &[Item], id: Id, numbered: bool) {
+fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: bool, fetchable: bool, loading: bool) -> bool {
+    let (title, layout, items) = (section.title.as_str(), section.layout, section.items.as_slice());
     let width = ui.available_width();
     let (cards, card_width) = columns(width, CARD_MIN, CARD_GAP);
     let (cells, cell_width) = columns(width, COMPACT_MIN, 12.0);
     let visible = match layout {
         Layout::Cards => cards,
         Layout::Compact => cells * COMPACT_ROWS,
-        Layout::Tracks | Layout::Top => usize::MAX,
+        Layout::Tracks | Layout::Top => section.brief.unwrap_or(usize::MAX),
     };
-    let foldable = items.len() > visible;
+    let remote = fetchable && section.all.is_some();
+    let foldable = remote || items.len() > visible;
     let mut open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(false);
     if !title.is_empty() || foldable {
         let (row, _) = ui.allocate_exact_size(vec2(width, 32.0), Sense::hover());
         label(ui, row.left_center(), Align2::LEFT_CENTER, title, bold(20.0), TEXT, width - 120.0);
-        if foldable {
+        if loading {
+            egui::Spinner::new()
+                .color(ACCENT)
+                .paint_at(ui, Rect::from_center_size(row.right_center() - vec2(16.0, 0.0), Vec2::splat(16.0)));
+        } else if foldable {
             let text = if open { "Show less" } else { "Show all" };
             if text_button(ui, row.right_center(), id.with("fold"), text).clicked() {
                 open = !open;
@@ -1113,6 +1497,7 @@ fn section_view(ui: &mut Ui, cx: &mut Cx, title: &str, layout: Layout, items: &[
             }
         }
     }
+    remote && open
 }
 
 fn top_result(ui: &mut Ui, cx: &mut Cx, items: &[Item], id: Id) {
@@ -1338,7 +1723,18 @@ fn page(ui: &mut Ui, cx: &mut Cx, load: Option<&Load>, pinned: &[Item], query: O
                         .as_ref()
                         .is_some_and(|header| !header.is_artist && section.items.iter().all(|item| item.thumb == header.thumb));
                 let id = ui.id().with(index);
-                section_view(ui, cx, &section.title, section.layout, &section.items, id, numbered);
+                let loading = cx.loading_sections.contains(&index);
+                if section_view(
+                    ui,
+                    cx,
+                    section,
+                    id,
+                    numbered,
+                    page.header.as_ref().is_some_and(|header| header.is_artist),
+                    loading,
+                ) {
+                    cx.out.push(Action::ShowAll(index));
+                }
             }
             if page.partial {
                 ui.add_space(30.0);
@@ -1569,6 +1965,12 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
         liked: &app.saved.liked,
         playlists: &app.library,
         single: matches!(route, Route::Search(_) | Route::Home),
+        loading_sections: app
+            .fetching_all
+            .iter()
+            .filter(|(fetching, _)| *fetching == route)
+            .map(|(_, at)| *at)
+            .collect(),
         out: &mut *out,
     };
     let margin = Margin {
@@ -1666,11 +2068,12 @@ fn keycaps(ui: &Ui, right_center: Pos2, parts: &[String], tint: Color32) -> f32 
 }
 
 fn hotkey_row(ui: &mut Ui, app: &App, command: Command, enabled: bool, out: &mut Vec<Action>) {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let portal = hotkeys::through_portal();
+    let sense = if enabled && !portal { Sense::click() } else { Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), HOTKEY_ROW), sense);
     let recording = app.recording == Some(command);
     let taken = app.hotkey_taken.contains(&command);
-    let hover = if enabled { hover_of(ui, &response) } else { 0.0 };
+    let hover = if enabled && !portal { hover_of(ui, &response) } else { 0.0 };
     let lit = ui
         .ctx()
         .animate_bool_with_time(response.id.with("recording"), recording, HOVER_TIME);
@@ -1682,12 +2085,17 @@ fn hotkey_row(ui: &mut Ui, app: &App, command: Command, enabled: bool, out: &mut
         Command::Previous => icon::SKIP_BACK,
         Command::VolumeUp => icon::SPEAKER_HIGH,
         Command::VolumeDown => icon::SPEAKER_LOW,
+        Command::Overlay => icon::PICTURE_IN_PICTURE,
     };
     let tone = MUTED.lerp_to_gamma(TEXT, hover);
     ui.painter()
         .text(pos2(rect.left() + 22.0, middle), Align2::CENTER_CENTER, symbol, glyph(17.0), tone);
     let edge = pos2(rect.right() - 14.0, middle);
     let caps_left = match (recording, app.saved.hotkey_combos[command as usize]) {
+        _ if portal => match hotkeys::portal_trigger(command) {
+            Some(trigger) => keycaps(ui, edge, &trigger.split('+').map(str::to_owned).collect::<Vec<_>>(), TEXT),
+            None => label(ui, edge, Align2::RIGHT_CENTER, "Set in system settings", sans(13.0), FAINT, 160.0).left(),
+        },
         (true, _) => keycaps(ui, edge, &["Press keys\u{2026}".to_owned()], ACCENT),
         (false, Some(combo)) => keycaps(ui, edge, &combo.parts(), TEXT),
         (false, None) => label(ui, edge, Align2::RIGHT_CENTER, "Not set", sans(13.0), FAINT, 120.0).left(),
@@ -1779,43 +2187,145 @@ fn discord_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     });
 }
 
+fn notice_section(ui: &mut Ui, title: &str, symbol: &str, reason: &str) {
+    let text_width = ui.available_width().min(SETTINGS_WIDTH) - 2.0 * CARD_PAD - 58.0;
+    let galley = fit(ui, reason, medium(13.5), MUTED, text_width, 8);
+    let row_height = SETTING_ROW.max(galley.size().y + 24.0);
+    section(ui, title, 2.0 * CARD_PAD + row_height, |ui| {
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::hover());
+        let at = pos2(row.left() + 22.0, row.center().y);
+        ui.painter().text(at, Align2::CENTER_CENTER, symbol, glyph(17.0), MUTED);
+        let at = pos2(row.left() + 46.0, row.center().y - galley.size().y / 2.0);
+        ui.painter().galley(at, galley, MUTED);
+    });
+}
+
 fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    let rows = if hotkeys::SUPPORTED {
-        Command::ALL.len() as f32 * HOTKEY_ROW
-    } else {
-        0.0
-    };
-    let height = 2.0 * CARD_PAD + SETTING_ROW + rows;
+    if let Some(reason) = hotkeys::unavailable() {
+        notice_section(ui, "Global hotkeys", icon::KEYBOARD, reason);
+        return;
+    }
+    let height = 2.0 * CARD_PAD + SETTING_ROW + hotkeys::listed().len() as f32 * HOTKEY_ROW;
     let card = section(ui, "Global hotkeys", height, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
-        if !hotkeys::SUPPORTED {
-            let (row, _) = ui.allocate_exact_size(size, Sense::hover());
-            let at = pos2(row.left() + 22.0, row.center().y);
-            ui.painter().text(at, Align2::CENTER_CENTER, icon::KEYBOARD, glyph(17.0), MUTED);
-            let text = "Global hotkeys are only available on Windows for now";
-            let at = pos2(row.left() + 46.0, row.center().y);
-            label(ui, at, Align2::LEFT_CENTER, text, medium(13.5), MUTED, size.x - 58.0);
-            return;
-        }
         if switch_row(ui, size, icon::KEYBOARD, "Enable global hotkeys", app.saved.hotkeys) {
             out.push(Action::GlobalHotkeys(!app.saved.hotkeys));
         }
         let on = ui.ctx().animate_bool_with_time(Id::new("hotkeys-on"), app.saved.hotkeys, 0.16);
         ui.multiply_opacity(egui::lerp(0.4..=1.0, on));
-        for command in Command::ALL {
+        for command in hotkeys::listed() {
             hotkey_row(ui, app, command, app.saved.hotkeys, out);
         }
     });
-    if !hotkeys::SUPPORTED {
-        return;
-    }
     let reset_at = pos2(card.right() - 10.0, card.top() - 15.0);
-    if app.saved.hotkey_combos != hotkeys::standard_combos()
+    if !hotkeys::through_portal()
+        && app.saved.hotkey_combos != hotkeys::standard_combos()
         && text_button(ui, reset_at, Id::new("hotkeys-reset"), "Reset to defaults").clicked()
     {
         out.push(Action::ResetHotkeys);
     }
-    let text = "Hotkeys keep working while Tubefast is minimized. Each one needs Ctrl, Alt or Shift.";
+    let text = if hotkeys::through_portal() {
+        "The keys are chosen in your desktop's system settings, under Shortcuts. Hotkeys keep working while Tubefast is minimized."
+    } else {
+        "Hotkeys keep working while Tubefast is minimized. Each one needs Ctrl, Alt or Shift."
+    };
+    let at = pos2(card.left() + 4.0, card.bottom() + SECTION_GAP / 2.0);
+    label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
+}
+
+fn window_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    section(ui, "Window", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        if switch_row(ui, size, icon::APP_WINDOW, "Minimize to tray on close", app.saved.hide_on_close) {
+            out.push(Action::HideOnClose(!app.saved.hide_on_close));
+        }
+    });
+}
+
+fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, enabled: bool) -> Option<f32> {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let middle = rect.center().y;
+    ui.painter()
+        .text(pos2(rect.left() + 22.0, middle), Align2::CENTER_CENTER, symbol, glyph(17.0), MUTED);
+    let track = Rect::from_center_size(pos2(rect.right() - 27.0 - SLIDER_WIDTH / 2.0, middle), vec2(SLIDER_WIDTH, 4.0));
+    let name_width = track.left() - rect.left() - 100.0;
+    label(
+        ui,
+        pos2(rect.left() + 46.0, middle),
+        Align2::LEFT_CENTER,
+        text,
+        medium(13.5),
+        TEXT,
+        name_width,
+    );
+    let fraction = (value - OVERLAY_OPACITY_MIN) / (1.0 - OVERLAY_OPACITY_MIN);
+    let reach = pos2(track.left() + track.width() * fraction, middle);
+    ui.painter().rect_filled(track, 2.0, veil(0.16));
+    ui.painter()
+        .rect_filled(Rect::from_min_max(track.min, pos2(reach.x, track.bottom())), 2.0, ACCENT);
+    ui.painter().circle_filled(reach, 7.0, TEXT);
+    let percent = format!("{}%", (value * 100.0).round());
+    label(
+        ui,
+        pos2(track.left() - 14.0, middle),
+        Align2::RIGHT_CENTER,
+        &percent,
+        sans(12.5),
+        MUTED,
+        60.0,
+    );
+    if !enabled {
+        return None;
+    }
+    let grab = ui.interact(track.expand2(vec2(10.0, 12.0)), Id::new(("slider", text)), Sense::click_and_drag());
+    describe(&grab, text);
+    let pointer = grab.interact_pointer_pos().filter(|_| grab.dragged() || grab.clicked())?;
+    let fraction = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
+    Some(egui::lerp(OVERLAY_OPACITY_MIN..=1.0, fraction))
+}
+
+fn overlay_unavailable() -> Option<&'static str> {
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
+    let on_wayland = cfg!(all(unix, not(target_os = "macos"))) && std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11;
+    (on_wayland && !hotkeys::layer_overlay())
+        .then_some("This desktop does not let apps stay on top of other windows on Wayland, so the overlay is not available here")
+}
+
+fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    if let Some(reason) = overlay_unavailable() {
+        notice_section(ui, "Overlay", icon::PICTURE_IN_PICTURE, reason);
+        return;
+    }
+    let height = 2.0 * CARD_PAD + 4.0 * SETTING_ROW;
+    let card = section(ui, "Overlay", height, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        if switch_row(ui, size, icon::PICTURE_IN_PICTURE, "Enable overlay", app.saved.overlay) {
+            out.push(Action::OverlayEnabled(!app.saved.overlay));
+        }
+        let on = ui.ctx().animate_bool_with_time(Id::new("overlay-on"), app.saved.overlay, 0.16);
+        ui.multiply_opacity(egui::lerp(0.4..=1.0, on));
+        if let Some(opacity) = slider_row(
+            ui,
+            size,
+            icon::CIRCLE_HALF,
+            "Opacity",
+            usable_opacity(app.saved.overlay_opacity),
+            app.saved.overlay,
+        ) {
+            out.push(Action::OverlayOpacity(opacity));
+        }
+        if switch_row(ui, size, icon::PLAY_CIRCLE, "Show playback controls", app.saved.overlay_controls) {
+            out.push(Action::OverlayControls(!app.saved.overlay_controls));
+        }
+        if switch_row(ui, size, icon::LIST_BULLETS, "Show next up", app.saved.overlay_next_up) {
+            out.push(Action::OverlayNextUp(!app.saved.overlay_next_up));
+        }
+    });
+    let reset_at = pos2(card.right() - 10.0, card.top() - 15.0);
+    if app.saved.overlay_position.is_some() && text_button(ui, reset_at, Id::new("overlay-reset"), "Reset position").clicked() {
+        out.push(Action::OverlayResetPosition);
+    }
+    let text = "Opens with the Show / hide overlay hotkey, which needs global hotkeys on. Drag it to move it.";
     let at = pos2(card.left() + 4.0, card.bottom() + SECTION_GAP / 2.0);
     label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
 }
@@ -1829,6 +2339,8 @@ fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     label(ui, at, Align2::LEFT_BOTTOM, "Settings", display(40.0), TEXT, width);
     discord_section(ui, app, out);
     hotkey_section(ui, app, out);
+    window_section(ui, app, out);
+    overlay_section(ui, app, out);
 }
 
 fn nav_item(ui: &mut Ui, symbol: &str, text: &str, active: bool, trailing: &str) -> Response {
@@ -2111,18 +2623,18 @@ fn sign_in_dialog(app: &mut App, ctx: &egui::Context, out: &mut Vec<Action>) {
             ui.add_space(12.0);
             paragraph(
                 ui,
-                "Opens a separate Edge or Chrome window. Sign in to Google there and it closes by itself.",
+                "Opens a separate Chrome, Edge, Brave, Firefox or a similar browser window. Sign in to Google there and it closes by itself.",
                 sans(13.0),
                 MUTED,
                 3,
             );
             ui.add_space(22.0);
 
-            eyebrow(ui, "Or paste your cookie", 0.0);
+            eyebrow(ui, "Or paste your cookie (harder)", 0.0);
             let steps = [
-                "1.  Open music.youtube.com in your browser and sign in.",
+                "1.  Open a private window, go to music.youtube.com and sign in.",
                 "2.  Press F12, open Network and click a request to music.youtube.com.",
-                "3.  Copy the whole cookie value under Request Headers and paste it here.",
+                "3.  Copy the whole cookie value under Request Headers, paste it here, then close that window without signing out.",
             ];
             for step in steps {
                 paragraph(ui, step, sans(13.0), MUTED, 2);
@@ -2179,6 +2691,115 @@ fn sign_in_dialog(app: &mut App, ctx: &egui::Context, out: &mut Vec<Action>) {
         });
     if modal.inner || modal.should_close() {
         out.push(Action::CloseSignIn);
+    }
+    browser_picker(app, ctx, out);
+}
+
+fn browser_picker(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
+    let Some(sign_in) = app.sign_in.as_ref().filter(|sign_in| sign_in.picking) else {
+        return;
+    };
+    let frame = Frame::new()
+        .fill(rgb(0x15161A))
+        .stroke(Stroke::new(1.0, veil(0.08)))
+        .corner_radius(18)
+        .inner_margin(Margin::same(26));
+    let modal = egui::Modal::new(Id::new("browser-picker"))
+        .frame(frame)
+        .backdrop_color(shade(0.5))
+        .show(ctx, |ui| {
+            ui.set_width(340.0);
+            let width = ui.available_width();
+            let (head, _) = ui.allocate_exact_size(vec2(width, 40.0), Sense::hover());
+            ui.painter()
+                .text(head.left_center(), Align2::LEFT_CENTER, "Choose a browser", display(30.0), TEXT);
+            let slot = Rect::from_center_size(pos2(head.right() - 16.0, head.center().y), Vec2::splat(34.0));
+            let closed = icon_button(ui, slot, Id::new("browser-picker-close"), icon::X, glyph(16.0), MUTED, "Close").clicked();
+            ui.add_space(16.0);
+            for (index, browser) in sign_in.browsers.iter().enumerate() {
+                let (row, _) = ui.allocate_exact_size(vec2(width, 56.0), Sense::hover());
+                let last_used = browser.name == app.saved.browser;
+                if browser_tile(ui, row.min, width, browser.name, last_used).clicked() {
+                    out.push(Action::PickBrowser(index));
+                }
+                ui.add_space(8.0);
+            }
+            closed
+        });
+    if modal.inner || modal.should_close() {
+        out.push(Action::ClosePicker);
+    }
+}
+
+fn browser_tile(ui: &Ui, at: Pos2, width: f32, name: &str, last_used: bool) -> Response {
+    let rect = Rect::from_min_size(at, vec2(width, 56.0));
+    let response = ui.interact(rect, Id::new(("browser-tile", name)), Sense::click());
+    let hover = hover_of(ui, &response);
+    let body = if response.is_pointer_button_down_on() {
+        rect.shrink(1.0)
+    } else {
+        rect
+    };
+    ui.painter().rect_filled(body, 14.0, veil(0.06 + 0.06 * hover));
+    let logo = Rect::from_center_size(pos2(rect.left() + 32.0, rect.center().y), Vec2::splat(28.0));
+    browser_logo(ui, name, logo, TEXT);
+    label(
+        ui,
+        pos2(rect.left() + 62.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        name,
+        medium(14.5),
+        TEXT,
+        width - 170.0,
+    );
+    if last_used {
+        label(
+            ui,
+            pos2(rect.right() - 18.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            "Last used",
+            sans(12.0),
+            MUTED,
+            90.0,
+        );
+    }
+    describe(&response, name);
+    response
+}
+
+fn logo_bytes(name: &str) -> Option<&'static [u8]> {
+    Some(match name {
+        "Chrome" => include_bytes!("../assets/browsers/chrome.png"),
+        "Brave" | "Brave Origin" => include_bytes!("../assets/browsers/brave.png"),
+        "Opera GX" => include_bytes!("../assets/browsers/operagx.png"),
+        "Firefox" => include_bytes!("../assets/browsers/firefox.png"),
+        "LibreWolf" => include_bytes!("../assets/browsers/librewolf.png"),
+        "Zen" => include_bytes!("../assets/browsers/zen.png"),
+        "Floorp" => include_bytes!("../assets/browsers/floorp.png"),
+        _ => return None,
+    })
+}
+
+fn browser_logo(ui: &Ui, name: &str, rect: Rect, ink: Color32) {
+    let key = Id::new(("browser-logo", name));
+    let cached = ui.ctx().data(|data| data.get_temp::<egui::TextureHandle>(key));
+    let texture = cached.or_else(|| {
+        let decoded = image::load_from_memory(logo_bytes(name)?).ok()?.to_rgba8();
+        let size = [decoded.width() as usize, decoded.height() as usize];
+        let handle = ui.ctx().load_texture(
+            name,
+            egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw()),
+            egui::TextureOptions::LINEAR,
+        );
+        ui.ctx().data_mut(|data| data.insert_temp(key, handle.clone()));
+        Some(handle)
+    });
+    match texture {
+        Some(texture) => egui::Image::from_texture((texture.id(), rect.size())).tint(ink).paint_at(ui, rect),
+        None => drop(
+            ui.painter()
+                .text(rect.center(), Align2::CENTER_CENTER, icon::GLOBE, solid(24.0), ink),
+        ),
     }
 }
 
@@ -2282,6 +2903,10 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let moved = ui.data(|data| data.get_temp::<Option<usize>>(follow)) != Some(sung);
     ui.data_mut(|data| data.insert_temp(follow, sung));
     let width = ui.available_width();
+    let romanized = app.saved.lyrics_romanized;
+    if lyrics.romanized.iter().any(Option::is_some) && switch_row(ui, vec2(width, 38.0), icon::TRANSLATE, "Show romanization", romanized) {
+        out.push(Action::RomanizeLyrics(!romanized));
+    }
     let sense = if lyrics.synced { Sense::click() } else { Sense::hover() };
     for (index, (start, line)) in lyrics.lines.iter().enumerate() {
         if line.is_empty() {
@@ -2289,7 +2914,15 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
             continue;
         }
         let galley = fit(ui, line, bold(20.0), TEXT, width, 4);
-        let (rect, response) = ui.allocate_exact_size(vec2(width, galley.size().y + 14.0), sense);
+        let reading = lyrics
+            .romanized
+            .get(index)
+            .and_then(Option::as_deref)
+            .filter(|_| romanized)
+            .map(|reading| fit(ui, reading, sans(15.0), TEXT, width, 3));
+        let reading_height = reading.as_ref().map_or(0.0, |reading| reading.size().y + 2.0);
+        let line_height = galley.size().y;
+        let (rect, response) = ui.allocate_exact_size(vec2(width, line_height + reading_height + 14.0), sense);
         let current = sung == Some(index);
         if current && moved {
             ui.scroll_to_rect(rect, Some(Align::Center));
@@ -2303,6 +2936,11 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
         let hover = hover_of(ui, &response);
         let ink = TEXT.gamma_multiply(0.34 + 0.66 * lit.max(0.5 * hover));
         ui.painter().galley_with_override_text_color(rect.min + vec2(0.0, 7.0), galley, ink);
+        if let Some(reading) = reading {
+            let tone = ink.gamma_multiply(0.7);
+            ui.painter()
+                .galley_with_override_text_color(rect.min + vec2(0.0, 9.0 + line_height), reading, tone);
+        }
         if lyrics.synced {
             point_at(&response);
         }
@@ -2319,17 +2957,17 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     }
 }
 
-fn queue_row(ui: &Ui, app: &App, item: &Item, slot: Rect, hover: f32) -> (Pos2, f32) {
+fn queue_row(ui: &Ui, art: &Art, cover: &str, title: &str, slot: Rect, hover: f32) -> (Pos2, f32) {
     ui.painter()
         .rect_filled(slot.expand2(vec2(8.0, 0.0)), ROW_RADIUS, veil(0.06 * hover));
-    let art = Rect::from_min_size(pos2(slot.left(), slot.center().y - 20.0), Vec2::splat(40.0));
-    artwork(ui, &app.art, app.saved.covers.of(item), art, 5.0);
-    let (left, width) = (art.right() + 12.0, slot.right() - art.right() - 44.0);
+    let frame = Rect::from_min_size(pos2(slot.left(), slot.center().y - 20.0), Vec2::splat(40.0));
+    artwork(ui, art, cover, frame, 5.0);
+    let (left, width) = (frame.right() + 12.0, slot.right() - frame.right() - 44.0);
     label(
         ui,
         pos2(left, slot.center().y - 9.0),
         Align2::LEFT_CENTER,
-        &item.title,
+        title,
         medium(13.5),
         TEXT,
         width,
@@ -2388,6 +3026,7 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
             out: &mut *out,
         };
         song_menu(response, &mut cx, item);
+        let (below, width) = queue_row(ui, &app.art, app.saved.covers.of(item), &item.title, slot, hover);
         byline(ui, out, item, response.id.with("artist"), below, sans(12.5), width);
         describe(response, &item.title);
         if hover > 0.0 {
@@ -2433,7 +3072,7 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
     ghost.painter().add(shadow.as_shape(plate, ROW_RADIUS));
     ghost.painter().rect_filled(plate, ROW_RADIUS, FLOATING);
     let item = &queue[upcoming + from];
-    let (below, width) = queue_row(&ghost, app, item, lifted, 0.0);
+    let (below, width) = queue_row(&ghost, &app.art, app.saved.covers.of(item), &item.title, lifted, 0.0);
     label(&ghost, below, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
     true
 }
@@ -2672,12 +3311,19 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
     let pressed = if toggle.is_pointer_button_down_on() { 1.0 } else { 0.0 };
     ui.painter()
         .circle_filled(center, 20.0 + lift - pressed, if active { TEXT } else { veil(0.14) });
+    let failed = app.player.failed() && !app.player.loading();
     if app.player.loading() {
         egui::Spinner::new()
             .color(PANEL)
             .paint_at(ui, Rect::from_center_size(center, Vec2::splat(18.0)));
     } else {
-        let symbol = if app.playing() { icon::PAUSE } else { icon::PLAY };
+        let symbol = if failed {
+            icon::ARROW_CLOCKWISE
+        } else if app.playing() {
+            icon::PAUSE
+        } else {
+            icon::PLAY
+        };
         ui.painter().text(
             center,
             Align2::CENTER_CENTER,
@@ -2686,7 +3332,13 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
             if active { PANEL } else { FAINT },
         );
     }
-    let name = if app.playing() { "Pause" } else { "Play" };
+    let name = if failed {
+        "Could not play. Try again"
+    } else if app.playing() {
+        "Pause"
+    } else {
+        "Play"
+    };
     describe(&toggle, name);
     if toggle.on_hover_text(name).clicked() {
         out.push(Action::Toggle);
@@ -2928,6 +3580,17 @@ fn release_notes(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_overlay_shrinks_with_what_it_hides() {
+        let full = overlay_height(OVERLAY_ROWS, true);
+        let no_controls = overlay_height(OVERLAY_ROWS, false);
+        let no_queue = overlay_height(0, true);
+        let compact = overlay_height(0, false);
+        assert!(compact < no_controls && compact < no_queue);
+        assert!(no_controls < full && no_queue < full);
+        assert_eq!(compact, overlay_base_height(false));
+    }
 
     #[test]
     fn links_each_artist_name_to_its_own_page() {

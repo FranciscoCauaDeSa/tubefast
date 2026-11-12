@@ -7,8 +7,12 @@ mod discord;
 mod hotkeys;
 mod media;
 mod opus;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod overlay_wayland;
 mod playback;
 mod player;
+mod romanize;
+mod tray;
 mod ui;
 mod update;
 mod ytm;
