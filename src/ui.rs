@@ -1191,6 +1191,9 @@ fn song_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
     menu_divider(ui);
 
     let mut choice = None;
+    if menu_row(ui, icon::RADIO, glyph(17.0), MUTED, "Start mix").clicked() {
+        choice = Some(Action::StartMix(item.clone()));
+    }
     if menu_row(ui, icon::ARROW_BEND_DOWN_RIGHT, glyph(17.0), MUTED, "Play next").clicked() {
         choice = Some(Action::PlayNext(item.clone()));
     }
