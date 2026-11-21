@@ -642,6 +642,10 @@ impl Client {
 
     pub fn stream(&self, video_id: &str) -> Result<Stream, String> {
         let mut response = self.player(video_id)?;
+        if audio(&response).is_none() && self.signed_in() && needs_authentication(&response) {
+            response = self.authenticated_player(video_id)?;
+            return audio(&response).ok_or_else(|| player_problem(&response));
+        }
         if audio(&response).is_none() {
             self.visitor.lock().unwrap().clear();
             response = self.player(video_id)?;
@@ -649,15 +653,7 @@ impl Client {
         if audio(&response).is_none() && self.refresh_clients() {
             response = self.player(video_id)?;
         }
-        audio(&response).ok_or_else(|| {
-            let status = &response["playabilityStatus"];
-            let reason = if playable(&response) {
-                None
-            } else {
-                status["reason"].as_str().or(status["status"].as_str())
-            };
-            reason.unwrap_or("No compatible audio stream for this track").to_owned()
-        })
+        audio(&response).ok_or_else(|| player_problem(&response))
     }
 
     fn player(&self, video_id: &str) -> Result<Value, String> {
@@ -669,8 +665,40 @@ impl Client {
         let version = client["clientVersion"].as_str().unwrap_or_default().to_owned();
         client["hl"] = LANGUAGE.into();
         client["visitorData"] = visitor.as_str().into();
-        let mut context = json!({ "client": client });
+        let body = json!({
+            "context": { "client": client },
+            "videoId": video_id,
+            "contentCheckOk": true,
+            "racyCheckOk": true,
+        });
+        let request = self
+            .agent
+            .post(PLAYER_API)
+            .set("User-Agent", &user_agent)
+            .set("X-YouTube-Client-Name", &id)
+            .set("X-YouTube-Client-Version", &version)
+            .set("X-Goog-Visitor-Id", &visitor);
+        match request.send_json(body) {
+            Ok(response) => read(response),
+            Err(ureq::Error::Status(code, _)) => {
+                Ok(json!({ "playabilityStatus": { "reason": format!("YouTube answered with HTTP {code}") } }))
+            }
+            Err(error) => Err(describe(error)),
+        }
+    }
+
+    fn authenticated_player(&self, video_id: &str) -> Result<Value, String> {
+        let visitor = self.ensure_visitor()?;
+        let version = self.clients.lock().unwrap().remix_version.clone();
         let page = self.page.lock().unwrap().clone();
+        let mut context = json!({
+            "client": {
+                "clientName": "WEB_REMIX",
+                "clientVersion": version.clone(),
+                "hl": LANGUAGE,
+                "visitorData": visitor.clone(),
+            }
+        });
         if !page.is_empty() {
             context["user"] = json!({ "onBehalfOfUser": page });
         }
@@ -682,9 +710,9 @@ impl Client {
         });
         let mut request = self
             .agent
-            .post(PLAYER_API)
-            .set("User-Agent", &user_agent)
-            .set("X-YouTube-Client-Name", &id)
+            .post(&format!("{MUSIC_API}player?prettyPrint=false"))
+            .set("User-Agent", WEB_UA)
+            .set("X-YouTube-Client-Name", REMIX_CLIENT_ID)
             .set("X-YouTube-Client-Version", &version)
             .set("X-Goog-Visitor-Id", &visitor)
             .set("Origin", auth::ORIGIN);
@@ -1041,6 +1069,25 @@ fn audio(response: &Value) -> Option<Stream> {
         }),
         None => aac,
     }
+}
+
+fn needs_authentication(response: &Value) -> bool {
+    let status = response["playabilityStatus"]["status"].as_str().unwrap_or_default();
+    let reason = response["playabilityStatus"]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(status, "LOGIN_REQUIRED" | "AGE_CHECK_REQUIRED") || reason.contains("sign in") || reason.contains("confirm your age")
+}
+
+fn player_problem(response: &Value) -> String {
+    let status = &response["playabilityStatus"];
+    let reason = if playable(response) {
+        None
+    } else {
+        status["reason"].as_str().or(status["status"].as_str())
+    };
+    reason.unwrap_or("No compatible audio stream for this track").to_owned()
 }
 
 fn describe(error: ureq::Error) -> String {
