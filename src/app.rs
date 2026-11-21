@@ -221,6 +221,7 @@ pub enum Action {
     PlayNext(Item),
     Enqueue(Item),
     StartMix(Item),
+    AddToPlaylist(Item, Item),
     Remove(usize),
     Toggle,
     Next,
@@ -288,6 +289,7 @@ enum Event {
     Discord(bool),
     Pressed(Action),
     Mix(Result<Vec<Item>, String>),
+    PlaylistAdded(String, Result<(), String>),
 }
 
 pub struct App {
@@ -854,6 +856,8 @@ impl App {
                 Event::Mix(Ok(items)) if !items.is_empty() => self.apply(Action::Play(items, 0), playback),
                 Event::Mix(Ok(_)) => self.notify("No songs found for this mix"),
                 Event::Mix(Err(error)) => self.notify(error),
+                Event::PlaylistAdded(title, Ok(())) => self.notify(format!("Added to {title}")),
+                Event::PlaylistAdded(_, Err(error)) => self.notify(format!("Could not add to playlist. {error}")),
                 Event::Lyrics(video_id, found) => {
                     if let Some((_, words)) = self.lyrics.as_mut().filter(|(wanted, _)| *wanted == video_id) {
                         *words = match found {
@@ -1071,6 +1075,9 @@ impl App {
             Action::PlayNext(item) => playback.play_next(item),
             Action::Enqueue(item) => playback.enqueue(item),
             Action::StartMix(item) => self.background(move |yt| Some(Event::Mix(yt.radio(&item.video_id)))),
+            Action::AddToPlaylist(song, playlist) => self.background(move |yt| {
+                Some(Event::PlaylistAdded(playlist.title, yt.add_to_playlist(&playlist.browse_id, &song.video_id)))
+            }),
             Action::Remove(index) => playback.remove(index),
             Action::Toggle | Action::Next | Action::Previous | Action::Seek(_) | Action::Pause(_) => playback.press(action),
             Action::Volume(volume) => {

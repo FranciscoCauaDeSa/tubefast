@@ -6,3 +6,4 @@
 - The queue panel now shows the whole queue, including songs that already played, and you can click any song to jump to it
 - Start a mix from a song's right-click menu
 - Show all artist albums and singles when opening their full lists
+- Add songs to a playlist from the right-click menu

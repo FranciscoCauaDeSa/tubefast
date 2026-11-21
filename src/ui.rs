@@ -407,6 +407,7 @@ struct Cx<'a> {
     playing: &'a str,
     paused: bool,
     liked: &'a [Item],
+    playlists: &'a [Item],
     single: bool,
     loading_sections: Vec<usize>,
     out: &'a mut Vec<Action>,
@@ -1194,6 +1195,19 @@ fn song_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
     if menu_row(ui, icon::RADIO, glyph(17.0), MUTED, "Start mix").clicked() {
         choice = Some(Action::StartMix(item.clone()));
     }
+    let add_playlist = menu_row(ui, icon::PLAYLIST, glyph(17.0), MUTED, "Add to playlist");
+    egui::Popup::menu(&add_playlist).gap(4.0).show(|ui| {
+        ui.set_width(MENU_WIDTH);
+        if cx.playlists.is_empty() {
+            menu_row(ui, icon::WARNING, glyph(17.0), FAINT, "No playlists found");
+        } else {
+            for playlist in cx.playlists {
+                if menu_row(ui, icon::PLAYLIST, glyph(17.0), MUTED, &playlist.title).clicked() {
+                    choice = Some(Action::AddToPlaylist(item.clone(), playlist.clone()));
+                }
+            }
+        }
+    });
     if menu_row(ui, icon::ARROW_BEND_DOWN_RIGHT, glyph(17.0), MUTED, "Play next").clicked() {
         choice = Some(Action::PlayNext(item.clone()));
     }
@@ -1977,6 +1991,7 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
         playing: app.now_playing().map_or("", |item| item.video_id.as_str()),
         paused: app.player.paused(),
         liked: &app.saved.liked,
+        playlists: &app.library,
         single: matches!(route, Route::Search(_) | Route::Home),
         loading_sections: app
             .fetching_all
