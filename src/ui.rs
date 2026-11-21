@@ -2720,12 +2720,22 @@ fn playlist_dialog(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
                     }
                 }
             } else {
+                let mut playlists: Vec<&Item> = app.library.iter().collect();
+                playlists.sort_by_key(|playlist| {
+                    if is_liked_music(playlist) {
+                        (0, 0)
+                    } else if let Some(position) = app.saved.playlist_activity.iter().position(|id| id == &playlist.browse_id) {
+                        (1, position)
+                    } else {
+                        (2, 0)
+                    }
+                });
                 egui::ScrollArea::vertical()
                     .id_salt("playlist-picker-list")
                     .max_height(360.0)
                     .auto_shrink(false)
                     .show(ui, |ui| {
-                        for playlist in &app.library {
+                        for playlist in playlists {
                             let row = wide_row(
                                 ui,
                                 vec2(ui.available_width(), 44.0),
@@ -2741,13 +2751,28 @@ fn playlist_dialog(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
                     });
             }
             if let Some(playlist) = selected {
-                out.push(Action::AddToPlaylist(song.clone(), Box::new(playlist)));
+                if is_liked_music(&playlist) {
+                    out.push(Action::ClosePlaylistPicker);
+                    if !app.saved.liked.iter().any(|liked| liked.video_id == song.video_id) {
+                        out.push(Action::Like(song.clone()));
+                    }
+                } else {
+                    out.push(Action::AddToPlaylist(song.clone(), Box::new(playlist)));
+                }
             }
             closed
         });
     if modal.inner || modal.should_close() {
         out.push(Action::ClosePlaylistPicker);
     }
+}
+
+fn is_liked_music(playlist: &Item) -> bool {
+    playlist.browse_id == "VLLM"
+        || playlist.browse_id == "LM"
+        || playlist.title.eq_ignore_ascii_case("Liked music")
+        || playlist.title.eq_ignore_ascii_case("Like music")
+        || playlist.title.eq_ignore_ascii_case("Liked songs")
 }
 
 fn sign_in_dialog(app: &mut App, ctx: &egui::Context, out: &mut Vec<Action>) {

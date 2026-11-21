@@ -72,6 +72,7 @@ pub struct Saved {
     pub signed_out_liked: Option<Vec<Item>>,
     pub recent: Vec<Item>,
     pub pinned: Vec<Item>,
+    pub playlist_activity: Vec<String>,
     pub visitor: String,
     pub queue_open: bool,
     pub shuffle: bool,
@@ -155,6 +156,7 @@ impl Default for Saved {
             signed_out_liked: None,
             recent: Vec::new(),
             pinned: Vec::new(),
+            playlist_activity: Vec::new(),
             visitor: String::new(),
             queue_open: true,
             shuffle: false,
@@ -293,7 +295,7 @@ enum Event {
     Pressed(Action),
     Mix(Result<Vec<Item>, String>),
     AlbumTracks(String, bool, Result<Vec<Item>, String>),
-    PlaylistAdded(String, Result<(), String>),
+    PlaylistAdded(Item, Result<(), String>),
 }
 
 pub struct App {
@@ -884,7 +886,12 @@ impl App {
                 }
                 Event::AlbumTracks(_, _, Ok(_)) => self.notify("No tracks found for this album"),
                 Event::AlbumTracks(_, _, Err(error)) => self.notify(error),
-                Event::PlaylistAdded(title, Ok(())) => self.notify(format!("Added to {title}")),
+                Event::PlaylistAdded(playlist, Ok(())) => {
+                    self.saved.playlist_activity.retain(|id| id != &playlist.browse_id);
+                    self.saved.playlist_activity.insert(0, playlist.browse_id.clone());
+                    self.saved.playlist_activity.truncate(100);
+                    self.notify(format!("Added to {}", playlist.title));
+                }
                 Event::PlaylistAdded(_, Err(error)) => self.notify(format!("Could not add to playlist. {error}")),
                 Event::Lyrics(video_id, found) => {
                     if let Some((_, words)) = self.lyrics.as_mut().filter(|(wanted, _)| *wanted == video_id) {
@@ -1119,10 +1126,8 @@ impl App {
                 self.playlist_picker = None;
                 let playlist = *playlist;
                 self.background(move |yt| {
-                    Some(Event::PlaylistAdded(
-                        playlist.title,
-                        yt.add_to_playlist(&playlist.browse_id, &song.video_id),
-                    ))
+                    let result = yt.add_to_playlist(&playlist.browse_id, &song.video_id);
+                    Some(Event::PlaylistAdded(playlist, result))
                 });
             }
             Action::Remove(index) => playback.remove(index),

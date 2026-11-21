@@ -11,3 +11,5 @@
 - Queue an album or play it next from its right-click menu
 - Use your signed-in session when starting playback
 - Open track actions from the queue and Now playing views with a right-click
+- Keep Liked Music at the top of the playlist picker and bring recently used playlists forward
+- Add songs to Liked Music by liking them
