@@ -520,17 +520,17 @@ impl Client {
             body["params"] = json!(target.params);
         }
         let response = self.music("browse", body, &[])?;
-        let mut token = tracks_continuation(&response);
+        let mut token = continuation(&response);
         let mut items = parse_page(&response)
             .sections
             .into_iter()
             .next()
             .map(|s| s.items)
             .unwrap_or_default();
-        for _ in 1..TRACK_PAGES {
-            let Some(next) = token.take() else { break };
+        let mut seen = HashSet::new();
+        while let Some(next) = token.take().filter(|next| seen.insert(next.clone())) {
             let Ok(response) = self.more(&next) else { break };
-            items.extend(parse_page(&response).songs());
+            items.extend(parse_page(&response).sections.into_iter().flat_map(|section| section.items));
             token = continuation(&response);
         }
         Ok(items)
