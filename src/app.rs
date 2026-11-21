@@ -224,7 +224,7 @@ pub enum Action {
     QueueAlbum(Item, bool),
     OpenPlaylistPicker(Item),
     ClosePlaylistPicker,
-    AddToPlaylist(Item, Item),
+    AddToPlaylist(Item, Box<Item>),
     Remove(usize),
     Toggle,
     Next,
@@ -1117,6 +1117,7 @@ impl App {
             Action::ClosePlaylistPicker => self.playlist_picker = None,
             Action::AddToPlaylist(song, playlist) => {
                 self.playlist_picker = None;
+                let playlist = *playlist;
                 self.background(move |yt| {
                     Some(Event::PlaylistAdded(
                         playlist.title,

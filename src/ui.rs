@@ -2741,7 +2741,7 @@ fn playlist_dialog(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
                     });
             }
             if let Some(playlist) = selected {
-                out.push(Action::AddToPlaylist(song.clone(), playlist));
+                out.push(Action::AddToPlaylist(song.clone(), Box::new(playlist)));
             }
             closed
         });
