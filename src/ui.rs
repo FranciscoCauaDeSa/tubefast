@@ -3194,6 +3194,17 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
         (from, (upcoming + over).min(rows.len() - 1), lifted)
     });
     let glide = if moving.is_some() { 0.12 } else { 0.0 };
+    let mut cx = Cx {
+        art: &app.art,
+        covers: &app.saved.covers,
+        playing: app.now_playing().map_or("", |item| item.video_id.as_str()),
+        paused: app.player.paused(),
+        liked: &app.saved.liked,
+        pinned: &app.saved.pinned,
+        single: false,
+        loading_sections: Vec::new(),
+        out,
+    };
     for (index, (slot, response)) in rows.iter().enumerate() {
         let item = &queue[index];
         let aside = match moving {
@@ -3218,8 +3229,9 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
         }
         let ink = if is_current { ACCENT } else { TEXT };
         let (below, width) = queue_row(&row, &app.art, app.saved.covers.of(item), &item.title, slot, hover, ink);
-        byline(&row, out, item, response.id.with("artist"), below, sans(12.5), width);
+        byline(&row, cx.out, item, response.id.with("artist"), below, sans(12.5), width);
         describe(response, &item.title);
+        song_menu(response, &mut cx, item);
         if hover > 0.0 && !is_current {
             let close = Rect::from_center_size(pos2(slot.right() - 12.0, slot.center().y), Vec2::splat(28.0));
             let tone = MUTED.gamma_multiply(hover);
@@ -3234,11 +3246,11 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
             )
             .clicked()
             {
-                out.push(Action::Remove(index));
+                cx.out.push(Action::Remove(index));
             }
         }
         if response.clicked() && !is_current {
-            out.push(Action::Jump(index));
+            cx.out.push(Action::Jump(index));
         }
     }
 
@@ -3246,7 +3258,7 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
     let (slot, response) = &rows[from];
     if response.drag_stopped() {
         let gap = if to > from { to + 1 } else { to };
-        out.push(Action::Move(from, gap));
+        cx.out.push(Action::Move(from, gap));
         return true;
     }
     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);

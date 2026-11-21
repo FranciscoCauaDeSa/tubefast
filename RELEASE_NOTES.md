@@ -10,3 +10,4 @@
 - Open and manage albums from their right-click menu
 - Queue an album or play it next from its right-click menu
 - Use your signed-in session when starting playback
+- Open track actions from the queue and Now playing views with a right-click
