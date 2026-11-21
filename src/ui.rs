@@ -407,7 +407,7 @@ struct Cx<'a> {
     playing: &'a str,
     paused: bool,
     liked: &'a [Item],
-    playlists: &'a [Item],
+    pinned: &'a [Item],
     single: bool,
     loading_sections: Vec<usize>,
     out: &'a mut Vec<Action>,
@@ -549,6 +549,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     app.title_bar.paint(frame);
     paint_scrubber(ctx, &scrub);
     sign_in_dialog(app, ctx, &mut out);
+    playlist_dialog(app, ctx, &mut out);
     notice(app, ctx, &mut out);
     release_notes(app, ctx, &mut out);
     out
@@ -1195,19 +1196,9 @@ fn song_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
     if menu_row(ui, icon::RADIO, glyph(17.0), MUTED, "Start mix").clicked() {
         choice = Some(Action::StartMix(item.clone()));
     }
-    let add_playlist = menu_row(ui, icon::PLAYLIST, glyph(17.0), MUTED, "Add to playlist");
-    egui::Popup::menu(&add_playlist).gap(4.0).show(|ui| {
-        ui.set_width(MENU_WIDTH);
-        if cx.playlists.is_empty() {
-            menu_row(ui, icon::WARNING, glyph(17.0), FAINT, "No playlists found");
-        } else {
-            for playlist in cx.playlists {
-                if menu_row(ui, icon::PLAYLIST, glyph(17.0), MUTED, &playlist.title).clicked() {
-                    choice = Some(Action::AddToPlaylist(item.clone(), playlist.clone()));
-                }
-            }
-        }
-    });
+    if menu_row(ui, icon::PLAYLIST, glyph(17.0), MUTED, "Add to playlist").clicked() {
+        choice = Some(Action::OpenPlaylistPicker(item.clone()));
+    }
     if menu_row(ui, icon::ARROW_BEND_DOWN_RIGHT, glyph(17.0), MUTED, "Play next").clicked() {
         choice = Some(Action::PlayNext(item.clone()));
     }
@@ -1243,6 +1234,73 @@ fn song_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
 fn song_menu(response: &Response, cx: &mut Cx, item: &Item) {
     if item.is_song() {
         response.context_menu(|ui| song_actions(ui, cx, item));
+    } else if !item.browse_id.is_empty() {
+        response.context_menu(|ui| collection_actions(ui, cx, item));
+    }
+}
+
+fn collection_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
+    ui.set_width(MENU_WIDTH);
+    let (head, _) = ui.allocate_exact_size(vec2(MENU_WIDTH, 56.0), Sense::hover());
+    let art = Rect::from_min_size(pos2(head.left() + 8.0, head.center().y - 20.0), Vec2::splat(40.0));
+    artwork(ui, cx.art, cx.covers.of(item), art, 5.0);
+    let (left, width) = (art.right() + 12.0, head.right() - art.right() - 20.0);
+    label(
+        ui,
+        pos2(left, head.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        &item.title,
+        medium(13.5),
+        TEXT,
+        width,
+    );
+    label(
+        ui,
+        pos2(left, head.center().y + 9.0),
+        Align2::LEFT_CENTER,
+        &item.subtitle,
+        sans(12.5),
+        MUTED,
+        width,
+    );
+    menu_divider(ui);
+
+    let mut choice = None;
+    let is_album = item.browse_id.starts_with("MPRE") || item.browse_id.starts_with("MPLA");
+    let (open_icon, open_text) = if item.is_artist {
+        (icon::MICROPHONE_STAGE, "Go to artist")
+    } else if is_album {
+        (icon::VINYL_RECORD, "Open album")
+    } else {
+        (icon::ARROW_SQUARE_OUT, "Open")
+    };
+    if is_album {
+        if menu_row(ui, icon::ARROW_BEND_DOWN_RIGHT, glyph(17.0), MUTED, "Play next").clicked() {
+            choice = Some(Action::QueueAlbum(item.clone(), true));
+        }
+        if menu_row(ui, icon::LIST_PLUS, glyph(17.0), MUTED, "Add to queue").clicked() {
+            choice = Some(Action::QueueAlbum(item.clone(), false));
+        }
+        menu_divider(ui);
+    }
+    if menu_row(ui, open_icon, glyph(17.0), MUTED, open_text).clicked() {
+        choice = Some(Action::Go(Route::Browse(item.browse_id.clone())));
+    }
+    let pinned = cx.pinned.iter().any(|saved| saved.browse_id == item.browse_id);
+    let (pin_icon, pin_text, pin_color) = if pinned {
+        (icon::BOOKMARK_SIMPLE, "Remove from library", ACCENT)
+    } else {
+        (icon::BOOKMARK_SIMPLE, "Save to library", MUTED)
+    };
+    if menu_row(ui, pin_icon, glyph(17.0), pin_color, pin_text).clicked() {
+        choice = Some(Action::Pin(item.clone()));
+    }
+    if menu_row(ui, icon::SHARE_NETWORK, glyph(17.0), MUTED, "Share").clicked() {
+        choice = Some(Action::Share(item.clone()));
+    }
+    if let Some(action) = choice {
+        cx.out.push(action);
+        ui.close();
     }
 }
 
@@ -1991,7 +2049,7 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
         playing: app.now_playing().map_or("", |item| item.video_id.as_str()),
         paused: app.player.paused(),
         liked: &app.saved.liked,
-        playlists: &app.library,
+        pinned: &app.saved.pinned,
         single: matches!(route, Route::Search(_) | Route::Home),
         loading_sections: app
             .fetching_all
@@ -2619,6 +2677,76 @@ fn account(app: &App, ui: &Ui, foot: Rect, out: &mut Vec<Action>) {
                 out.push(Action::OpenSignIn);
             }
         }
+    }
+}
+
+fn playlist_dialog(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
+    let Some(song) = app.playlist_picker.as_ref() else { return };
+    let frame = Frame::new()
+        .fill(rgb(0x15161A))
+        .stroke(Stroke::new(1.0, veil(0.08)))
+        .corner_radius(18)
+        .inner_margin(Margin::same(24));
+    let modal = egui::Modal::new(Id::new("playlist-picker"))
+        .frame(frame)
+        .backdrop_color(shade(0.6))
+        .show(ctx, |ui| {
+            ui.set_width(440.0);
+            let width = ui.available_width();
+            let (head, _) = ui.allocate_exact_size(vec2(width, 40.0), Sense::hover());
+            ui.painter()
+                .text(head.left_center(), Align2::LEFT_CENTER, "Add to playlist", display(30.0), TEXT);
+            let slot = Rect::from_center_size(pos2(head.right() - 16.0, head.center().y), Vec2::splat(34.0));
+            let closed = icon_button(ui, slot, Id::new("playlist-picker-close"), icon::X, glyph(16.0), MUTED, "Close").clicked();
+            ui.add_space(8.0);
+            let song_pos = ui.cursor().min;
+            label(ui, song_pos, Align2::LEFT_TOP, &song.title, medium(14.0), MUTED, width);
+            ui.add_space(30.0);
+            let mut selected = None;
+            if app.library.is_empty() {
+                paragraph(
+                    ui,
+                    "No playlists found. Save a playlist to your library on YouTube Music to add songs here.",
+                    sans(14.0),
+                    MUTED,
+                    3,
+                );
+                if app.saved.account.is_none() {
+                    ui.add_space(12.0);
+                    let button_pos = ui.cursor().min;
+                    if pill(ui, button_pos, Id::new("playlist-picker-sign-in"), icon::USER, "Sign in", true).clicked() {
+                        out.push(Action::ClosePlaylistPicker);
+                        out.push(Action::OpenSignIn);
+                    }
+                }
+            } else {
+                egui::ScrollArea::vertical()
+                    .id_salt("playlist-picker-list")
+                    .max_height(360.0)
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        for playlist in &app.library {
+                            let row = wide_row(
+                                ui,
+                                vec2(ui.available_width(), 44.0),
+                                icon::PLAYLIST,
+                                glyph(17.0),
+                                MUTED,
+                                &playlist.title,
+                            );
+                            if row.clicked() {
+                                selected = Some(playlist.clone());
+                            }
+                        }
+                    });
+            }
+            if let Some(playlist) = selected {
+                out.push(Action::AddToPlaylist(song.clone(), playlist));
+            }
+            closed
+        });
+    if modal.inner || modal.should_close() {
+        out.push(Action::ClosePlaylistPicker);
     }
 }
 

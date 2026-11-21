@@ -405,12 +405,8 @@ impl Client {
 
     pub fn add_to_playlist(&self, playlist_id: &str, video_id: &str) -> Result<(), String> {
         let playlist_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
-        self.music(
-            "playlist/add",
-            json!({ "playlistId": playlist_id, "videoIds": [video_id] }),
-            &[],
-        )
-        .map(drop)
+        self.music("playlist/add", json!({ "playlistId": playlist_id, "videoIds": [video_id] }), &[])
+            .map(drop)
     }
 
     fn feed(&self, order: usize, pages: usize, emit: &(dyn Fn(usize, Vec<Section>) + Sync)) -> Result<(), String> {

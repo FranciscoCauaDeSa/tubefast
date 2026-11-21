@@ -221,6 +221,9 @@ pub enum Action {
     PlayNext(Item),
     Enqueue(Item),
     StartMix(Item),
+    QueueAlbum(Item, bool),
+    OpenPlaylistPicker(Item),
+    ClosePlaylistPicker,
     AddToPlaylist(Item, Item),
     Remove(usize),
     Toggle,
@@ -289,6 +292,7 @@ enum Event {
     Discord(bool),
     Pressed(Action),
     Mix(Result<Vec<Item>, String>),
+    AlbumTracks(String, bool, Result<Vec<Item>, String>),
     PlaylistAdded(String, Result<(), String>),
 }
 
@@ -319,6 +323,7 @@ pub struct App {
     speaker: Speaker,
     synced: u64,
     pub sign_in: Option<SignIn>,
+    pub playlist_picker: Option<Item>,
     pub library: Vec<Item>,
     pub accounts: Vec<Account>,
     pub player: Status,
@@ -417,6 +422,7 @@ impl App {
             speaker,
             synced: 0,
             sign_in: None,
+            playlist_picker: None,
             library: Vec::new(),
             accounts: Vec::new(),
             player: status,
@@ -856,6 +862,28 @@ impl App {
                 Event::Mix(Ok(items)) if !items.is_empty() => self.apply(Action::Play(items, 0), playback),
                 Event::Mix(Ok(_)) => self.notify("No songs found for this mix"),
                 Event::Mix(Err(error)) => self.notify(error),
+                Event::AlbumTracks(title, play_next, Ok(songs)) if !songs.is_empty() => {
+                    if play_next && playback.current().is_some() {
+                        for song in songs.into_iter().rev() {
+                            playback.play_next(song);
+                        }
+                    } else if play_next {
+                        for song in songs {
+                            playback.play_next(song);
+                        }
+                    } else {
+                        for song in songs {
+                            playback.enqueue(song);
+                        }
+                    }
+                    self.notify(if play_next {
+                        format!("Added {title} to play next")
+                    } else {
+                        format!("Added {title} to queue")
+                    });
+                }
+                Event::AlbumTracks(_, _, Ok(_)) => self.notify("No tracks found for this album"),
+                Event::AlbumTracks(_, _, Err(error)) => self.notify(error),
                 Event::PlaylistAdded(title, Ok(())) => self.notify(format!("Added to {title}")),
                 Event::PlaylistAdded(_, Err(error)) => self.notify(format!("Could not add to playlist. {error}")),
                 Event::Lyrics(video_id, found) => {
@@ -1075,9 +1103,27 @@ impl App {
             Action::PlayNext(item) => playback.play_next(item),
             Action::Enqueue(item) => playback.enqueue(item),
             Action::StartMix(item) => self.background(move |yt| Some(Event::Mix(yt.radio(&item.video_id)))),
-            Action::AddToPlaylist(song, playlist) => self.background(move |yt| {
-                Some(Event::PlaylistAdded(playlist.title, yt.add_to_playlist(&playlist.browse_id, &song.video_id)))
-            }),
+            Action::QueueAlbum(album, play_next) => {
+                let (title, browse_id) = (album.title, album.browse_id);
+                self.background(move |yt| {
+                    Some(Event::AlbumTracks(
+                        title,
+                        play_next,
+                        yt.browse(&browse_id, &|_| {}).map(|page| page.songs()),
+                    ))
+                });
+            }
+            Action::OpenPlaylistPicker(item) => self.playlist_picker = Some(item),
+            Action::ClosePlaylistPicker => self.playlist_picker = None,
+            Action::AddToPlaylist(song, playlist) => {
+                self.playlist_picker = None;
+                self.background(move |yt| {
+                    Some(Event::PlaylistAdded(
+                        playlist.title,
+                        yt.add_to_playlist(&playlist.browse_id, &song.video_id),
+                    ))
+                });
+            }
             Action::Remove(index) => playback.remove(index),
             Action::Toggle | Action::Next | Action::Previous | Action::Seek(_) | Action::Pause(_) => playback.press(action),
             Action::Volume(volume) => {

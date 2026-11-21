@@ -7,3 +7,5 @@
 - Start a mix from a song's right-click menu
 - Show all artist albums and singles when opening their full lists
 - Add songs to a playlist from the right-click menu
+- Open and manage albums from their right-click menu
+- Queue an album or play it next from its right-click menu
