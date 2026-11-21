@@ -9,3 +9,4 @@
 - Add songs to a playlist from the right-click menu
 - Open and manage albums from their right-click menu
 - Queue an album or play it next from its right-click menu
+- Use your signed-in session when starting playback

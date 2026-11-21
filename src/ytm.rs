@@ -405,8 +405,23 @@ impl Client {
 
     pub fn add_to_playlist(&self, playlist_id: &str, video_id: &str) -> Result<(), String> {
         let playlist_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
-        self.music("playlist/add", json!({ "playlistId": playlist_id, "videoIds": [video_id] }), &[])
-            .map(drop)
+        let response = self.music(
+            "browse/edit_playlist",
+            json!({
+                "playlistId": playlist_id,
+                "actions": [{ "action": "ACTION_ADD_VIDEO", "addedVideoId": video_id }],
+            }),
+            &[],
+        )?;
+        if response["status"].as_str().is_some_and(|status| status.contains("SUCCEEDED")) {
+            Ok(())
+        } else {
+            Err(response["error"]["message"]
+                .as_str()
+                .or_else(|| response["status"].as_str())
+                .unwrap_or("YouTube Music did not confirm adding the song")
+                .to_owned())
+        }
     }
 
     fn feed(&self, order: usize, pages: usize, emit: &(dyn Fn(usize, Vec<Section>) + Sync)) -> Result<(), String> {
@@ -654,21 +669,55 @@ impl Client {
         let version = client["clientVersion"].as_str().unwrap_or_default().to_owned();
         client["hl"] = LANGUAGE.into();
         client["visitorData"] = visitor.as_str().into();
+        let mut context = json!({ "client": client });
+        let page = self.page.lock().unwrap().clone();
+        if !page.is_empty() {
+            context["user"] = json!({ "onBehalfOfUser": page });
+        }
         let body = json!({
-            "context": { "client": client },
+            "context": context,
             "videoId": video_id,
             "contentCheckOk": true,
             "racyCheckOk": true,
         });
-        let request = self
+        let mut request = self
             .agent
             .post(PLAYER_API)
             .set("User-Agent", &user_agent)
             .set("X-YouTube-Client-Name", &id)
             .set("X-YouTube-Client-Version", &version)
-            .set("X-Goog-Visitor-Id", &visitor);
-        match request.send_json(body) {
-            Ok(response) => read(response),
+            .set("X-Goog-Visitor-Id", &visitor)
+            .set("Origin", auth::ORIGIN);
+        let cookie = self.session.lock().unwrap().clone();
+        if let Some(cookie) = &cookie {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
+            let signature = auth::authorization(cookie, now).unwrap_or_default();
+            request = request
+                .set("Cookie", cookie)
+                .set("Authorization", &signature)
+                .set("X-Origin", auth::ORIGIN)
+                .set("X-Goog-AuthUser", "0");
+        }
+        let mut outcome = request.clone().send_json(body.clone());
+        if cookie.is_some() && is_unauthorized(&outcome) {
+            std::thread::sleep(REJECTION_RECHECK_DELAY);
+            outcome = request.send_json(body);
+        }
+        match outcome {
+            Ok(response) => {
+                if let Some(used) = &cookie {
+                    self.rotate(used, &response.all("set-cookie"));
+                }
+                let response = read(response)?;
+                if cookie.is_some() {
+                    self.judge_unauthorized("", Signal::Accepted);
+                }
+                Ok(response)
+            }
+            Err(ureq::Error::Status(401, _)) if cookie.is_some() => {
+                self.judge_unauthorized(&cookie.unwrap_or_default(), Signal::Rejected);
+                Err(SESSION_REJECTED.to_owned())
+            }
             Err(ureq::Error::Status(code, _)) => {
                 Ok(json!({ "playabilityStatus": { "reason": format!("YouTube answered with HTTP {code}") } }))
             }
